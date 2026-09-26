@@ -123,7 +123,7 @@ function Install-Package($Name, $WingetId, $ChocoId, $ScoopId, [scriptblock]$Fou
         [string[]]$managerArgs = $m.Args
         try { & $m.Name @managerArgs | Out-Host } catch { Write-Warn "$($m.Name) failed: $_" }
         Update-SessionPath
-        if (& $Found) { Write-Info "Installed '$Name' via $($m.Name)."; return }
+        if (& $Found) { Write-Info "Installed '$Name'."; return }
     }
     if (-not $tried) { Fail "No supported package manager (winget/choco/scoop) found. Install '$Name' manually and re-run." }
     Fail "Could not install '$Name' with any available package manager. Install it manually (or open a new terminal so PATH refreshes) and re-run."
