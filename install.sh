@@ -149,6 +149,31 @@ canon_path() {
 
 same_path() { [ "$(canon_path "$1")" = "$(canon_path "$2")" ]; }
 
+# check_source_master - exit 1 unless the local clone's master holds install.sh
+# and .gitignore: clone and adopt install that branch, not the checked-out one.
+check_source_master() {
+    listed=$(git -C "$LOCAL_SRC" ls-tree --name-only refs/heads/master -- install.sh .gitignore 2>/dev/null) || listed=""
+    if ! printf '%s\n' "$listed" | grep -Fqx install.sh || ! printf '%s\n' "$listed" | grep -Fqx .gitignore; then
+        die "The clone at $LOCAL_SRC has no usable master branch (install.sh or .gitignore missing). In the clone, run: git checkout master, then git pull --ff-only."
+    fi
+}
+
+# warn_source_branch - warn when the local clone's master is behind its
+# origin/master, or when the clone has another branch checked out.
+warn_source_branch() {
+    if git -C "$LOCAL_SRC" rev-parse --verify -q refs/remotes/origin/master >/dev/null 2>&1; then
+        behind=$(git -C "$LOCAL_SRC" rev-list --count refs/heads/master..refs/remotes/origin/master 2>/dev/null) || behind=0
+        if [ "${behind:-0}" -gt 0 ]; then
+            warn "The clone's master is behind its origin/master: installing the older commit. Run git pull --ff-only in the clone for the latest."
+        fi
+    fi
+    branch=$(git -C "$LOCAL_SRC" symbolic-ref -q --short HEAD 2>/dev/null) || branch=""
+    if [ -z "$branch" ]; then branch="a detached HEAD"; fi
+    if [ "$branch" != master ]; then
+        warn "The clone is on $branch, not master: only master is installed."
+    fi
+}
+
 find_source() {
     script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" 2>/dev/null && pwd -P) || script_dir=""
     if [ -n "$script_dir" ]; then
@@ -159,6 +184,7 @@ find_source() {
         fi
     fi
     if [ -n "$LOCAL_SRC" ]; then
+        check_source_master
         FETCH_URL=$LOCAL_SRC
         ORIGIN_URL=$(git -C "$LOCAL_SRC" config --get remote.origin.url 2>/dev/null) || ORIGIN_URL=""
         if [ -z "$ORIGIN_URL" ]; then
@@ -166,6 +192,7 @@ find_source() {
             ORIGIN_URL=$REPO_URL
         fi
         info "Installing from local checkout $LOCAL_SRC (origin $ORIGIN_URL)."
+        warn_source_branch
     else
         FETCH_URL=$REPO_URL
         ORIGIN_URL=$REPO_URL
@@ -226,7 +253,7 @@ update_existing() {
         warn "Tracked files in $TARGET have local changes - skipping the pull. Commit or discard them, then re-run."
         return 0
     fi
-    if check_remote "$ORIGIN_URL" warn; then
+    if check_remote "$origin" warn; then
         git -C "$TARGET" pull --ff-only || warn "Could not fast-forward $TARGET; leaving it as-is."
     fi
 }
@@ -242,7 +269,7 @@ clone_fresh() {
     info "Cloning into $TARGET."
     git clone -q -c core.autocrlf=false --branch master "$FETCH_URL" "$TARGET" || die "git clone of $FETCH_URL failed."
     if [ "$FETCH_URL" != "$ORIGIN_URL" ]; then
-        git -C "$TARGET" remote set-url origin "$ORIGIN_URL"
+        git -C "$TARGET" remote set-url origin "$ORIGIN_URL" || die "git remote set-url failed."
     fi
 }
 
@@ -257,7 +284,7 @@ bootstrap() {
     if [ -e "$TARGET/.git" ]; then
         origin=$(git -C "$TARGET" config --get remote.origin.url 2>/dev/null) || origin=""
         if [ -n "$origin" ] && same_url "$origin" "$ORIGIN_URL"; then
-            if ! git -C "$TARGET" rev-parse --verify -q HEAD >/dev/null 2>&1; then
+            if ! git -C "$TARGET" rev-parse --verify -q HEAD >/dev/null 2>&1 && [ -z "$(git -C "$TARGET" for-each-ref refs/heads)" ]; then
                 warn "Found an unfinished adopt in $TARGET: starting it again."
                 rm -rf "$TARGET/.git"
                 adopt_existing
@@ -289,7 +316,7 @@ abort_adopt() {
 # backup_conflicts - copy files that differ from the repo (content, not line
 # endings) to <path>.bak.<STAMP>.
 backup_conflicts() {
-    conflicts=$(git -C "$TARGET" -c core.quotepath=off diff --name-only --diff-filter=M 2>/dev/null) \
+    conflicts=$(git -C "$TARGET" -c core.quotepath=off diff --name-only --diff-filter=MT 2>/dev/null) \
         || abort_adopt "git diff failed in $TARGET."
     if [ -z "$conflicts" ]; then return 0; fi
     set -f; old_ifs=$IFS; IFS=$NL
@@ -322,6 +349,10 @@ adopt_existing() {
     git -C "$TARGET" config core.autocrlf false || abort_adopt "git config failed in $TARGET."
     git -C "$TARGET" remote add origin "$FETCH_URL" || abort_adopt "git remote add failed."
     git -C "$TARGET" fetch -q origin || abort_adopt "git fetch from $FETCH_URL failed."
+    # A missing origin/master is left to the reset below, which reports it.
+    if gitignore=$(git -C "$TARGET" ls-tree --name-only origin/master -- .gitignore 2>/dev/null) && [ -z "$gitignore" ]; then
+        abort_adopt "The fetched master has no .gitignore."
+    fi
     git -C "$TARGET" reset -q origin/master || abort_adopt "git reset to origin/master failed."
     git -C "$TARGET" branch -q -u origin/master || abort_adopt "git branch -u origin/master failed."
     if [ "$FETCH_URL" != "$ORIGIN_URL" ]; then
@@ -533,34 +564,36 @@ plugin_sync() {
         if ! printf '%s\n' "$manifest" | grep -Fqx -- "P$TAB$pid"; then extras="$extras$pid$NL"; fi
     done
     IFS=$old_ifs; set +f
+    if [ -n "$present" ]; then info "Already present: ${present#, }"; fi
+    if [ -n "$added" ]; then info "Installed: ${added#, }"; fi
+    if [ -n "$failed" ]; then warn "Failed: ${failed#, }"; fi
+    if [ -n "$extras" ]; then
+        set -f; IFS=$NL
+        for pid in $extras; do
+            if [ "$PRUNE" = 1 ] && [ "$YES" = 0 ]; then
+                answer=$(ask "Uninstall $pid (installed but not in settings.json)? (y/n)" "n")
+                case "$answer" in
+                    [Yy]*)
+                        if claude plugin uninstall "$pid" </dev/null; then info "Uninstalled $pid."; else warn "Could not uninstall $pid."; fi ;;
+                    *) info "Kept $pid." ;;
+                esac
+            else
+                info "Installed but not in settings.json: $pid"
+            fi
+        done
+        IFS=$old_ifs; set +f
+        if [ "$PRUNE" = 1 ] && [ "$YES" = 1 ]; then
+            info "Non-interactive run: prune only reports."
+        elif [ "$PRUNE" = 0 ]; then
+            info "Re-run with --prune (-Prune) to choose which of these to uninstall."
+        fi
+    fi
+    # After prune too: claude plugin uninstall may rewrite settings.json as well.
     if ! cmp -s "$snapshot" "$settings"; then
         cp "$snapshot" "$settings"
         info "Restored settings.json after the claude CLI changed it: the tracked file is the plugin manifest."
     fi
     rm -f "$snapshot"
-    if [ -n "$present" ]; then info "Already present: ${present#, }"; fi
-    if [ -n "$added" ]; then info "Installed: ${added#, }"; fi
-    if [ -n "$failed" ]; then warn "Failed: ${failed#, }"; fi
-    if [ -z "$extras" ]; then return 0; fi
-    set -f; IFS=$NL
-    for pid in $extras; do
-        if [ "$PRUNE" = 1 ] && [ "$YES" = 0 ]; then
-            answer=$(ask "Uninstall $pid (installed but not in settings.json)? (y/n)" "n")
-            case "$answer" in
-                [Yy]*)
-                    if claude plugin uninstall "$pid" </dev/null; then info "Uninstalled $pid."; else warn "Could not uninstall $pid."; fi ;;
-                *) info "Kept $pid." ;;
-            esac
-        else
-            info "Installed but not in settings.json: $pid"
-        fi
-    done
-    IFS=$old_ifs; set +f
-    if [ "$PRUNE" = 1 ] && [ "$YES" = 1 ]; then
-        info "Non-interactive run: prune only reports."
-    elif [ "$PRUNE" = 0 ]; then
-        info "Re-run with --prune (-Prune) to choose which of these to uninstall."
-    fi
 }
 
 # --- summary ----------------------------------------------------------------

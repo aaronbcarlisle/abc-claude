@@ -145,6 +145,34 @@ function Install-Deps {
 function Resolve-Full($p) { try { [System.IO.Path]::GetFullPath($p).TrimEnd('\', '/') } catch { $p } }
 function Test-SamePath($a, $b) { return ((Resolve-Full $a) -ieq (Resolve-Full $b)) }
 
+# Exit 1 unless the local clone's master holds install.sh and .gitignore: clone
+# and adopt install that branch, not the checked-out one.
+function Assert-SourceMaster {
+    $src = $script:LocalSrc
+    $listed = @(Invoke-Quiet 'git' @('-C', $src, 'ls-tree', '--name-only', 'refs/heads/master', '--', 'install.sh', '.gitignore'))
+    if ($script:NativeExit -ne 0 -or $listed -cnotcontains 'install.sh' -or $listed -cnotcontains '.gitignore') {
+        Fail "The clone at $src has no usable master branch (install.sh or .gitignore missing). In the clone, run: git checkout master, then git pull --ff-only."
+    }
+}
+
+# Warn when the local clone's master is behind its origin/master, or when the
+# clone has another branch checked out.
+function Write-SourceBranchWarnings {
+    $src = $script:LocalSrc
+    Invoke-Quiet 'git' @('-C', $src, 'rev-parse', '--verify', '-q', 'refs/remotes/origin/master') | Out-Null
+    if ($script:NativeExit -eq 0) {
+        $behind = Get-GitLine @('-C', $src, 'rev-list', '--count', 'refs/heads/master..refs/remotes/origin/master')
+        if ($behind -and [int]$behind -gt 0) {
+            Write-Warn "The clone's master is behind its origin/master: installing the older commit. Run git pull --ff-only in the clone for the latest."
+        }
+    }
+    $branch = Get-GitLine @('-C', $src, 'symbolic-ref', '-q', '--short', 'HEAD')
+    if (-not $branch) { $branch = 'a detached HEAD' }
+    if ($branch -ne 'master') {
+        Write-Warn "The clone is on $branch, not master: only master is installed."
+    }
+}
+
 function Find-Source {
     if ($ScriptDir) {
         $top = Get-GitLine @('-C', $ScriptDir, 'rev-parse', '--show-toplevel')
@@ -156,6 +184,7 @@ function Find-Source {
         }
     }
     if ($script:LocalSrc) {
+        Assert-SourceMaster
         $script:FetchUrl = $script:LocalSrc
         $script:OriginUrl = Get-GitLine @('-C', $script:LocalSrc, 'config', '--get', 'remote.origin.url')
         if (-not $script:OriginUrl) {
@@ -163,6 +192,7 @@ function Find-Source {
             $script:OriginUrl = $RepoUrl
         }
         Write-Info "Installing from local checkout $($script:LocalSrc) (origin $($script:OriginUrl))."
+        Write-SourceBranchWarnings
     } else {
         $script:FetchUrl = $RepoUrl
         $script:OriginUrl = $RepoUrl
@@ -219,7 +249,7 @@ function Restore-Missing {
     Write-Info "Restored $($missing.Count) missing tracked file(s)."
 }
 
-function Update-Existing {
+function Update-Existing($Origin) {
     $T = $script:Target
     Write-Info "$T is an abc-claude checkout - updating it."
     Write-Info 'Close running Claude Code sessions first: they can hold files open.'
@@ -229,7 +259,7 @@ function Update-Existing {
         Write-Warn "Tracked files in $T have local changes - skipping the pull. Commit or discard them, then re-run."
         return
     }
-    if (Test-Remote $script:OriginUrl) {
+    if (Test-Remote $Origin) {
         if (-not (Invoke-Git @('-C', $T, 'pull', '--ff-only'))) { Write-Warn "Could not fast-forward $T; leaving it as-is." }
     }
 }
@@ -250,7 +280,7 @@ function Invoke-Clone {
         Fail "git clone of $($script:FetchUrl) failed."
     }
     if ($script:FetchUrl -ne $script:OriginUrl) {
-        Invoke-Git @('-C', $T, 'remote', 'set-url', 'origin', $script:OriginUrl) | Out-Null
+        if (-not (Invoke-Git @('-C', $T, 'remote', 'set-url', 'origin', $script:OriginUrl))) { Fail 'git remote set-url failed.' }
     }
 }
 
@@ -268,13 +298,15 @@ function Invoke-Bootstrap {
         $origin = Get-GitLine @('-C', $T, 'config', '--get', 'remote.origin.url')
         if ($origin -and ((Normalize-Url $origin) -eq (Normalize-Url $script:OriginUrl))) {
             Invoke-Quiet 'git' @('-C', $T, 'rev-parse', '--verify', '-q', 'HEAD') | Out-Null
-            if ($script:NativeExit -ne 0) {
+            $unborn = ($script:NativeExit -ne 0)
+            $branches = @(Invoke-Quiet 'git' @('-C', $T, 'for-each-ref', 'refs/heads') | Where-Object { $_ })
+            if ($unborn -and $branches.Count -eq 0) {
                 Write-Warn "Found an unfinished adopt in ${T}: starting it again."
                 Remove-Item -LiteralPath (Join-Path $T '.git') -Recurse -Force -ErrorAction SilentlyContinue
                 Invoke-Adopt
                 return
             }
-            Update-Existing
+            Update-Existing $origin
             return
         }
         if (-not $origin) { $origin = 'none' }
@@ -295,7 +327,7 @@ function Stop-Adopt($m) {
 # Copy files that differ from the repo (content, not line endings) to <path>.bak.<Stamp>.
 function Backup-Conflicts {
     $T = $script:Target
-    $conflicts = @(Invoke-Quiet 'git' @('-C', $T, '-c', 'core.quotepath=off', 'diff', '--name-only', '--diff-filter=M') | Where-Object { $_ })
+    $conflicts = @(Invoke-Quiet 'git' @('-C', $T, '-c', 'core.quotepath=off', 'diff', '--name-only', '--diff-filter=MT') | Where-Object { $_ })
     if ($script:NativeExit -ne 0) { Stop-Adopt "git diff failed in $T." }
     foreach ($f in $conflicts) {
         $src = Join-Path $T $f
@@ -330,6 +362,9 @@ function Invoke-Adopt {
     if (-not (Invoke-Git @('-C', $T, 'config', 'core.autocrlf', 'false'))) { Stop-Adopt "git config failed in $T." }
     if (-not (Invoke-Git @('-C', $T, 'remote', 'add', 'origin', $script:FetchUrl))) { Stop-Adopt 'git remote add failed.' }
     if (-not (Invoke-Git @('-C', $T, 'fetch', '-q', 'origin'))) { Stop-Adopt "git fetch from $($script:FetchUrl) failed." }
+    # A missing origin/master is left to the reset below, which reports it.
+    $gitignore = @(Invoke-Quiet 'git' @('-C', $T, 'ls-tree', '--name-only', 'origin/master', '--', '.gitignore') | Where-Object { $_ })
+    if ($script:NativeExit -eq 0 -and $gitignore.Count -eq 0) { Stop-Adopt 'The fetched master has no .gitignore.' }
     if (-not (Invoke-Git @('-C', $T, 'reset', '-q', 'origin/master'))) { Stop-Adopt 'git reset to origin/master failed.' }
     if (-not (Invoke-Git @('-C', $T, 'branch', '-q', '-u', 'origin/master'))) { Stop-Adopt 'git branch -u origin/master failed.' }
     if ($script:FetchUrl -ne $script:OriginUrl) {
@@ -505,32 +540,34 @@ function Invoke-PluginSync {
         & claude plugin install $id | Out-Host
         if ($LASTEXITCODE -eq 0) { $added += $id } else { Write-Warn "Could not install $id."; $failed += $id }
     }
-    $after = [System.IO.File]::ReadAllBytes($settingsPath)
-    if ([Convert]::ToBase64String($before) -ne [Convert]::ToBase64String($after)) {
-        [System.IO.File]::WriteAllBytes($settingsPath, $before)
-        Write-Info 'Restored settings.json after the claude CLI changed it: the tracked file is the plugin manifest.'
-    }
     if ($present.Count -gt 0) { Write-Info "Already present: $($present -join ', ')" }
     if ($added.Count -gt 0) { Write-Info "Installed: $($added -join ', ')" }
     if ($failed.Count -gt 0) { Write-Warn "Failed: $($failed -join ', ')" }
 
     $extras = @($installed | Where-Object { $wanted -notcontains $_ })
-    if ($extras.Count -eq 0) { return }
-    foreach ($id in $extras) {
-        if ($Prune -and -not $Yes) {
-            $answer = Ask "Uninstall $id (installed but not in settings.json)? (y/n)" 'n'
-            if ($answer -match '^[Yy]') {
-                & claude plugin uninstall $id | Out-Host
-                if ($LASTEXITCODE -eq 0) { Write-Info "Uninstalled $id." } else { Write-Warn "Could not uninstall $id." }
+    if ($extras.Count -gt 0) {
+        foreach ($id in $extras) {
+            if ($Prune -and -not $Yes) {
+                $answer = Ask "Uninstall $id (installed but not in settings.json)? (y/n)" 'n'
+                if ($answer -match '^[Yy]') {
+                    & claude plugin uninstall $id | Out-Host
+                    if ($LASTEXITCODE -eq 0) { Write-Info "Uninstalled $id." } else { Write-Warn "Could not uninstall $id." }
+                } else {
+                    Write-Info "Kept $id."
+                }
             } else {
-                Write-Info "Kept $id."
+                Write-Info "Installed but not in settings.json: $id"
             }
-        } else {
-            Write-Info "Installed but not in settings.json: $id"
         }
+        if ($Prune -and $Yes) { Write-Info 'Non-interactive run: prune only reports.' }
+        elseif (-not $Prune) { Write-Info 'Re-run with --prune (-Prune) to choose which of these to uninstall.' }
     }
-    if ($Prune -and $Yes) { Write-Info 'Non-interactive run: prune only reports.' }
-    elseif (-not $Prune) { Write-Info 'Re-run with --prune (-Prune) to choose which of these to uninstall.' }
+    # After prune too: claude plugin uninstall may rewrite settings.json as well.
+    $after = [System.IO.File]::ReadAllBytes($settingsPath)
+    if ([Convert]::ToBase64String($before) -ne [Convert]::ToBase64String($after)) {
+        [System.IO.File]::WriteAllBytes($settingsPath, $before)
+        Write-Info 'Restored settings.json after the claude CLI changed it: the tracked file is the plugin manifest.'
+    }
 }
 
 # --- summary ----------------------------------------------------------------

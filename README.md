@@ -35,11 +35,13 @@ gh repo clone aaronbcarlisle/abc-claude ~/src/abc-claude
 sh ~/src/abc-claude/install.sh
 ```
 
-On Windows, run `powershell -ExecutionPolicy Bypass -File <dir>\install.ps1` instead. The installer adopts the clone's committed work into `~/.claude` and sets `origin` to the clone's `origin`. Uncommitted edits in the clone aren't carried over. Delete the clone afterwards.
+With a clone you already have, run `git checkout master`, then `git pull --ff-only` in it first: the installer installs the clone's local `master` branch, whatever is checked out.
+
+On Windows, run `powershell -ExecutionPolicy Bypass -File <dir>\install.ps1` instead. The installer adopts the committed work on the clone's `master` into `~/.claude` and sets `origin` to the clone's `origin`. Uncommitted edits in the clone aren't carried over. Delete the clone afterwards.
 
 ## What it does
 
-1. **Dependencies:** installs git and python if they're missing. On Windows it tries winget (`--scope user`), then choco, then scoop. Elsewhere it uses the first of apt-get, dnf, yum, pacman, zypper, apk, brew and port that it finds. It never needs admin. `claude` and `gh` are optional.
+1. **Dependencies:** installs git and python if they're missing. It needs git 2.28 or later (for `git init -b`); upgrade an older git first. On Windows it tries winget (`--scope user`), then choco, then scoop. Elsewhere it uses the first of apt-get, dnf, yum, pacman, zypper, apk, brew and port that it finds. It never needs admin. `claude` and `gh` are optional.
 2. **Source:** the checkout it runs from, if that's an abc-claude checkout; otherwise `ABC_CLAUDE_REPO`.
 3. **Bootstrap** `~/.claude` (or `CLAUDE_CONFIG_DIR`), depending on what's there:
    - **Nothing:** clones the repo.

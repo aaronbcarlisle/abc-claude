@@ -156,6 +156,65 @@ class InstallerScenarios:
         self.assertOk(result)
         self.assertIn("Installing from local checkout", result.output)
         self.assertEqual(self.target_git("config", "--get", "remote.origin.url"), str(self.sb.remote))
+        self.assertNotIn("is behind its origin/master", result.output)
+        self.assertNotIn("not master: only master is installed", result.output)
+
+    # --- final review: the clone's master is what gets installed -------------
+    CLONE_BEHIND = ("[abc-claude] The clone's master is behind its origin/master: installing the older commit. "
+                    "Run git pull --ff-only in the clone for the latest.")
+    CLONE_NO_MASTER = ("has no usable master branch (install.sh or .gitignore missing). "
+                       "In the clone, run: git checkout master, then git pull --ff-only.")
+
+    def make_clone(self):
+        clone = self.sb.root / "clone"
+        h.git("clone", "-q", str(self.sb.remote), str(clone))
+        return clone
+
+    def clone_env(self):
+        return self.sb.env(ABC_CLAUDE_REPO=self.sb.root / "ignored.git")
+
+    def test_clone_behind_origin_on_detached_head_warns_and_installs_its_master(self):
+        clone = self.make_clone()
+        self.sb.push_change({"CLAUDE.md": "# Newer rules\n"})
+        h.git("-C", str(clone), "fetch", "-q")
+        h.git("-C", str(clone), "checkout", "-q", "--detach")
+        result = self.install("--yes", script_dir=clone, env=self.clone_env())
+        self.assertOk(result)
+        self.assertIn(self.CLONE_BEHIND, result.output)
+        self.assertIn("[abc-claude] The clone is on a detached HEAD, not master: only master is installed.",
+                      result.output)
+        self.assertEqual((self.sb.target / "CLAUDE.md").read_bytes(), b"# Fixture global rules\n")
+
+    def test_clone_on_another_branch_warns_and_installs_master(self):
+        clone = self.make_clone()
+        h.git("-C", str(clone), "checkout", "-q", "-b", "work")
+        (clone / "CLAUDE.md").write_bytes(b"# Work branch rules\n")
+        h.git("-C", str(clone), *h.FIXTURE_IDENT, "commit", "-q", "-am", "work")
+        result = self.install("--yes", script_dir=clone, env=self.clone_env())
+        self.assertOk(result)
+        self.assertIn("[abc-claude] The clone is on work, not master: only master is installed.", result.output)
+        self.assertNotIn("is behind its origin/master", result.output)
+        self.assertEqual((self.sb.target / "CLAUDE.md").read_bytes(), b"# Fixture global rules\n")
+
+    def test_clone_whose_master_is_not_abc_claude_exits_1_and_changes_nothing(self):
+        clone = self.make_clone()
+        c = str(clone)
+        h.git("-C", c, "checkout", "-q", "-b", "work")
+        h.git("-C", c, "checkout", "-q", "--orphan", "stale")
+        h.git("-C", c, "rm", "-rfq", ".")
+        (clone / "README.md").write_bytes(b"# Initial commit\n")
+        h.git("-C", c, "add", "README.md")
+        h.git("-C", c, *h.FIXTURE_IDENT, "commit", "-q", "-m", "Initial commit")
+        h.git("-C", c, "branch", "-q", "-f", "master", "stale")
+        h.git("-C", c, "checkout", "-q", "work")
+        self.sb.target.mkdir()
+        (self.sb.target / "settings.json").write_bytes(b'{"mine": true}\n')
+        before = h.snapshot(self.sb.target)
+        result = self.install("--yes", script_dir=clone, env=self.clone_env())
+        self.assertEqual(result.returncode, 1, result)
+        self.assertIn("[abc-claude] The clone at ", result.output)
+        self.assertIn(self.CLONE_NO_MASTER, result.output)
+        self.assertEqual(h.snapshot(self.sb.target), before)
 
     # --- task 6: adopt ------------------------------------------------------
     def seed_existing_target(self):
@@ -249,6 +308,39 @@ class InstallerScenarios:
         self.assertIn("Nothing was changed.", result.output)
         self.assertFalse((self.sb.target / ".git").exists())
         self.assertEqual((self.sb.target / "settings.json").read_bytes(), b"{}\n")
+
+    def test_adopt_of_a_master_without_gitignore_aborts(self):
+        seed = self.sb.root / "bad-seed"
+        bad = self.sb.root / "bad.git"
+        seed.mkdir()
+        h.git("init", "-q", "-b", "master", cwd=seed)
+        (seed / "README.md").write_bytes(b"# Not abc-claude\n")
+        h.git("add", "README.md", cwd=seed)
+        h.git(*h.FIXTURE_IDENT, "commit", "-q", "-m", "Initial commit", cwd=seed)
+        h.git("clone", "-q", "--bare", str(seed), str(bad))
+        self.sb.target.mkdir()
+        (self.sb.target / "settings.json").write_bytes(b"{}\n")
+        result = self.install("--yes", env=self.sb.env(ABC_CLAUDE_REPO=bad))
+        self.assertEqual(result.returncode, 1, result)
+        self.assertIn("[abc-claude] The fetched master has no .gitignore. Nothing was changed.", result.output)
+        self.assertFalse((self.sb.target / ".git").exists())
+        self.assertEqual((self.sb.target / "settings.json").read_bytes(), b"{}\n")
+
+    def test_unborn_head_next_to_a_local_branch_keeps_the_history(self):
+        t = self.sb.target
+        t.mkdir()
+        h.git("init", "-q", "-b", "master", cwd=t)
+        h.git("remote", "add", "origin", str(self.sb.remote), cwd=t)
+        (t / "notes.md").write_bytes(b"# My notes\n")
+        h.git("add", "notes.md", cwd=t)
+        h.git(*h.FIXTURE_IDENT, "commit", "-q", "-m", "local work", cwd=t)
+        commit = self.target_git("rev-parse", "refs/heads/master")
+        h.git("checkout", "-q", "--orphan", "wip", cwd=t)
+        result = self.install("--yes")
+        self.assertOk(result)
+        self.assertNotIn("Found an unfinished adopt", result.output)
+        self.assertTrue((t / ".git").is_dir())
+        self.assertEqual(self.target_git("rev-parse", "refs/heads/master"), commit)
 
     # --- task 7: machine-local ----------------------------------------------
     def test_local_md_created_from_template_under_yes(self):
