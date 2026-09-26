@@ -265,11 +265,66 @@ bootstrap() {
     if [ -e "$TARGET" ] && [ ! -d "$TARGET" ]; then
         die "$TARGET exists and is not a directory. Move it aside, then re-run."
     fi
-    if [ -d "$TARGET" ]; then
-        die "$TARGET exists and is not a git repo. Move it aside, then re-run. Nothing was changed."
-    fi
     warn_uncommitted_source
-    clone_fresh
+    if [ -d "$TARGET" ]; then
+        adopt_existing
+    else
+        clone_fresh
+    fi
+}
+
+# --- bootstrap: adopt -------------------------------------------------------
+# abort_adopt MESSAGE - undo the git init of a failed adopt, then exit 1.
+abort_adopt() {
+    rm -rf "$TARGET/.git"
+    die "$1 Nothing was changed."
+}
+
+# backup_conflicts - copy files that differ from the repo (content, not line
+# endings) to <path>.bak.<STAMP>.
+backup_conflicts() {
+    conflicts=$(git -C "$TARGET" -c core.quotepath=off diff --name-only --diff-filter=M 2>/dev/null) \
+        || abort_adopt "git diff failed in $TARGET."
+    if [ -z "$conflicts" ]; then return 0; fi
+    set -f; old_ifs=$IFS; IFS=$NL
+    for f in $conflicts; do
+        cp -p "$TARGET/$f" "$TARGET/$f.bak.$STAMP" || abort_adopt "Could not back up $f."
+        BACKUPS="$BACKUPS$f.bak.$STAMP$NL"
+    done
+    IFS=$old_ifs; set +f
+}
+
+# normalize_eol - rewrite tracked files whose working copy still has CRLF.
+normalize_eol() {
+    crlf=$(git -C "$TARGET" -c core.quotepath=off ls-files --eol | awk -F "$TAB" '$1 ~ /w\/(crlf|mixed)/ { print $2 }') || crlf=""
+    if [ -z "$crlf" ]; then return 0; fi
+    count=0
+    set -f; old_ifs=$IFS; IFS=$NL
+    for f in $crlf; do
+        rm -f "$TARGET/$f"
+        git -C "$TARGET" checkout -- "$f" || die "Could not rewrite $f (a running Claude Code session may hold it open). Close Claude Code and re-run."
+        count=$((count + 1))
+    done
+    IFS=$old_ifs; set +f
+    info "Rewrote $count tracked file(s) with LF line endings."
+}
+
+adopt_existing() {
+    check_remote "$FETCH_URL" die
+    warn "Adopting the existing $TARGET: close running Claude Code sessions first, since they can hold files open."
+    git -C "$TARGET" init -q -b master || abort_adopt "git init failed in $TARGET."
+    git -C "$TARGET" config core.autocrlf false
+    git -C "$TARGET" remote add origin "$FETCH_URL" || abort_adopt "git remote add failed."
+    git -C "$TARGET" fetch -q origin || abort_adopt "git fetch from $FETCH_URL failed."
+    git -C "$TARGET" reset -q origin/master || abort_adopt "git reset to origin/master failed."
+    git -C "$TARGET" branch -q -u origin/master || abort_adopt "git branch -u origin/master failed."
+    if [ "$FETCH_URL" != "$ORIGIN_URL" ]; then
+        git -C "$TARGET" remote set-url origin "$ORIGIN_URL"
+    fi
+    backup_conflicts
+    git -C "$TARGET" checkout -- . || die "git checkout failed partway (a running Claude Code session may hold a file open). Close Claude Code and re-run: the re-run restores the missing files."
+    normalize_eol
+    info "Adopted $TARGET."
 }
 
 # --- summary ----------------------------------------------------------------

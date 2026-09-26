@@ -274,9 +274,66 @@ function Invoke-Bootstrap {
         Fail "$T is a git repo with a different origin ($origin). Move it aside or set CLAUDE_CONFIG_DIR, then re-run. Nothing was changed."
     }
     if (Test-Path -LiteralPath $T -PathType Leaf) { Fail "$T exists and is not a directory. Move it aside, then re-run." }
-    if (Test-Path -LiteralPath $T) { Fail "$T exists and is not a git repo. Move it aside, then re-run. Nothing was changed." }
     Warn-UncommittedSource
-    Invoke-Clone
+    if (Test-Path -LiteralPath $T) { Invoke-Adopt } else { Invoke-Clone }
+}
+
+# --- bootstrap: adopt -------------------------------------------------------
+# Undo the git init of a failed adopt, then exit 1.
+function Stop-Adopt($m) {
+    Remove-Item -LiteralPath (Join-Path $script:Target '.git') -Recurse -Force -ErrorAction SilentlyContinue
+    Fail "$m Nothing was changed."
+}
+
+# Copy files that differ from the repo (content, not line endings) to <path>.bak.<Stamp>.
+function Backup-Conflicts {
+    $T = $script:Target
+    $conflicts = @(Invoke-Quiet 'git' @('-C', $T, '-c', 'core.quotepath=off', 'diff', '--name-only', '--diff-filter=M') | Where-Object { $_ })
+    if ($script:NativeExit -ne 0) { Stop-Adopt "git diff failed in $T." }
+    foreach ($f in $conflicts) {
+        $src = Join-Path $T $f
+        try { Copy-Item -LiteralPath $src -Destination "$src.bak.$Stamp" -Force } catch { Stop-Adopt "Could not back up $f." }
+        $script:Backups += "$f.bak.$Stamp"
+    }
+}
+
+# Rewrite tracked files whose working copy still has CRLF.
+function Repair-LineEndings {
+    $T = $script:Target
+    $lines = @(Invoke-Quiet 'git' @('-C', $T, '-c', 'core.quotepath=off', 'ls-files', '--eol'))
+    $crlf = @(foreach ($l in $lines) {
+        $parts = ([string]$l) -split "`t", 2
+        if ($parts.Count -eq 2 -and $parts[0] -match 'w/(crlf|mixed)') { $parts[1] }
+    })
+    if ($crlf.Count -eq 0) { return }
+    foreach ($f in $crlf) {
+        Remove-Item -LiteralPath (Join-Path $T $f) -Force
+        if (-not (Invoke-Git @('-C', $T, 'checkout', '--', $f))) {
+            Fail "Could not rewrite $f (a running Claude Code session may hold it open). Close Claude Code and re-run."
+        }
+    }
+    Write-Info "Rewrote $($crlf.Count) tracked file(s) with LF line endings."
+}
+
+function Invoke-Adopt {
+    $T = $script:Target
+    Test-Remote $script:FetchUrl -Fatal | Out-Null
+    Write-Warn "Adopting the existing ${T}: close running Claude Code sessions first, since they can hold files open."
+    if (-not (Invoke-Git @('-C', $T, 'init', '-q', '-b', 'master'))) { Stop-Adopt "git init failed in $T." }
+    Invoke-Git @('-C', $T, 'config', 'core.autocrlf', 'false') | Out-Null
+    if (-not (Invoke-Git @('-C', $T, 'remote', 'add', 'origin', $script:FetchUrl))) { Stop-Adopt 'git remote add failed.' }
+    if (-not (Invoke-Git @('-C', $T, 'fetch', '-q', 'origin'))) { Stop-Adopt "git fetch from $($script:FetchUrl) failed." }
+    if (-not (Invoke-Git @('-C', $T, 'reset', '-q', 'origin/master'))) { Stop-Adopt 'git reset to origin/master failed.' }
+    if (-not (Invoke-Git @('-C', $T, 'branch', '-q', '-u', 'origin/master'))) { Stop-Adopt 'git branch -u origin/master failed.' }
+    if ($script:FetchUrl -ne $script:OriginUrl) {
+        Invoke-Git @('-C', $T, 'remote', 'set-url', 'origin', $script:OriginUrl) | Out-Null
+    }
+    Backup-Conflicts
+    if (-not (Invoke-Git @('-C', $T, 'checkout', '--', '.'))) {
+        Fail 'git checkout failed partway (a running Claude Code session may hold a file open). Close Claude Code and re-run: the re-run restores the missing files.'
+    }
+    Repair-LineEndings
+    Write-Info "Adopted $T."
 }
 
 # --- summary ----------------------------------------------------------------

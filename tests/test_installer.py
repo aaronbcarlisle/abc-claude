@@ -157,6 +157,75 @@ class InstallerScenarios:
         self.assertIn("Installing from local checkout", result.output)
         self.assertEqual(self.target_git("config", "--get", "remote.origin.url"), str(self.sb.remote))
 
+    # --- task 6: adopt ------------------------------------------------------
+    def seed_existing_target(self):
+        """A non-git ~/.claude with a conflict, a CRLF-only difference, junk and a local-only file."""
+        t = self.sb.target
+        files = {
+            "settings.json": b'{"model": "sonnet"}\r\n',          # conflict: differs in content
+            "CLAUDE.md": b"# Fixture global rules\r\n",            # differs only in line endings
+            "history.jsonl": b'{"junk": 1}\r\n',                   # Claude Code data, ignored
+            "projects/p/memory/MEMORY.md": b"memory\r\n",          # ignored
+            "skills/synced/x/SKILL.md": b"synced\n",               # ignored
+            "rules/mine.md": b"# Local-only rule\n",               # untracked, reported
+        }
+        h.Sandbox.write_files(t, files)
+        return files
+
+    def test_adopt_backs_up_conflicts_keeps_junk_and_reports_local_only(self):
+        files = self.seed_existing_target()
+        result = self.install("--yes")
+        self.assertOk(result)
+        t = self.sb.target
+        baks = h.backups(t)
+        self.assertEqual(len(baks), 1, baks)
+        self.assertTrue(re.fullmatch(r"settings\.json\.bak\.\d{14}", baks[0]), baks)
+        self.assertEqual((t / baks[0]).read_bytes(), files["settings.json"])
+        for rel in ("history.jsonl", "projects/p/memory/MEMORY.md", "skills/synced/x/SKILL.md", "rules/mine.md"):
+            self.assertEqual((t / rel).read_bytes(), files[rel], rel)
+        for rel in h.tracked_files(t):
+            self.assertNotIn(b"\r\n", (t / rel).read_bytes(), rel)
+        self.assertEqual((t / "CLAUDE.md").read_bytes(), b"# Fixture global rules\n")
+        self.assertIn("Local-only files to review", result.output)
+        self.assertIn("    rules/mine.md", result.output)
+        self.assertNotIn("history.jsonl", result.output)
+        self.assertIn("    " + baks[0], result.output)
+        self.assertEqual(self.target_git("status", "--porcelain"), "?? rules/mine.md")
+        self.assertEqual(self.target_git("rev-parse", "--abbrev-ref", "@{u}"), "origin/master")
+
+    def test_rerun_after_adopt_makes_no_new_backups(self):
+        self.seed_existing_target()
+        self.assertOk(self.install("--yes"))
+        first = h.backups(self.sb.target)
+        self.assertOk(self.install("--yes"))
+        self.assertEqual(h.backups(self.sb.target), first)
+
+    def test_run_from_clone_elsewhere_adopts_with_clone_origin(self):
+        clone = self.sb.root / "clone"
+        h.git("clone", "-q", str(self.sb.remote), str(clone))
+        (clone / "CLAUDE.md").write_bytes(b"# Uncommitted edit in the clone\n")
+        self.sb.target.mkdir()
+        (self.sb.target / "history.jsonl").write_bytes(b"junk\n")
+        env = self.sb.env(ABC_CLAUDE_REPO=self.sb.root / "ignored.git")
+        result = self.install("--yes", script_dir=clone, env=env)
+        self.assertOk(result)
+        self.assertIn("has uncommitted edits", result.output)
+        self.assertEqual(self.target_git("config", "--get", "remote.origin.url"),
+                         h.git("-C", str(clone), "config", "--get", "remote.origin.url").strip())
+        self.assertEqual((self.sb.target / "CLAUDE.md").read_bytes(), b"# Fixture global rules\n")
+        self.assertEqual((self.sb.target / "history.jsonl").read_bytes(), b"junk\n")
+
+    def test_failed_adopt_leaves_no_git_dir(self):
+        self.sb.target.mkdir()
+        (self.sb.target / "settings.json").write_bytes(b"{}\n")
+        empty = self.sb.root / "empty.git"
+        h.git("init", "-q", "--bare", str(empty))
+        result = self.install("--yes", env=self.sb.env(ABC_CLAUDE_REPO=empty))
+        self.assertEqual(result.returncode, 1, result)
+        self.assertIn("Nothing was changed.", result.output)
+        self.assertFalse((self.sb.target / ".git").exists())
+        self.assertEqual((self.sb.target / "settings.json").read_bytes(), b"{}\n")
+
 
 class ShTests(InstallerScenarios, unittest.TestCase):
     INTERP = "sh"
