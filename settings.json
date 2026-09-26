@@ -1,5 +1,9 @@
 {
   "permissions": {
+    "allow": [
+      "Bash(gh pr create *)",
+      "Bash(gh pr merge --squash *)"
+    ],
     "defaultMode": "auto"
   },
   "model": "opus",
@@ -42,7 +46,7 @@
     },
     "claude-fable-5-1": {},
     "claude-opus-5-5": {
-      "effortLevel": "high"
+      "effortLevel": "xhigh"
     }
   },
   "fastModePerSessionOptIn": true,
