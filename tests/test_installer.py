@@ -144,9 +144,11 @@ class InstallerScenarios:
 
     def test_run_in_place_from_the_target(self):
         self.assertOk(self.install("--yes"))
+        h.git("-C", str(self.sb.target), "checkout", "-q", "-b", "work")
         result = self.install("--yes", script_dir=self.sb.target)
         self.assertOk(result)
         self.assertIn("using it in place", result.output)
+        self.assertNotIn("not master: only master is installed", result.output)
 
     def test_run_from_a_fresh_clone_elsewhere_into_missing_target(self):
         clone = self.sb.root / "clone"
@@ -282,6 +284,24 @@ class InstallerScenarios:
         self.assertEqual(self.target_git("rev-parse", "--abbrev-ref", "@{u}"), "origin/master")
         # HEAD is born: rev-parse --verify raises via h.git's check=True if not.
         self.assertNotEqual(self.target_git("rev-parse", "--verify", "HEAD"), "")
+
+    def test_rerun_from_clone_after_interrupted_adopt_recovers(self):
+        clone = self.make_clone()
+        files = self.seed_existing_target()
+        t = self.sb.target
+        h.git("init", "-q", "-b", "master", cwd=t)
+        h.git("remote", "add", "origin", str(clone), cwd=t)   # interrupted before remote set-url
+        result = self.install("--yes", script_dir=clone, env=self.clone_env())
+        self.assertOk(result)
+        self.assertIn("Found an unfinished adopt in ", result.output)
+        self.assertIn(": starting it again.", result.output)
+        self.assertIn("Adopted ", result.output)
+        self.assertEqual(self.target_git("config", "--get", "remote.origin.url"), str(self.sb.remote))
+        self.assertEqual(self.target_git("rev-parse", "--abbrev-ref", "@{u}"), "origin/master")
+        self.assertEqual((t / "CLAUDE.md").read_bytes(), b"# Fixture global rules\n")
+        baks = h.backups(t)
+        self.assertEqual(len(baks), 1, baks)
+        self.assertEqual((t / baks[0]).read_bytes(), files["settings.json"])
 
     def test_run_from_clone_elsewhere_adopts_with_clone_origin(self):
         clone = self.sb.root / "clone"

@@ -184,7 +184,6 @@ function Find-Source {
         }
     }
     if ($script:LocalSrc) {
-        Assert-SourceMaster
         $script:FetchUrl = $script:LocalSrc
         $script:OriginUrl = Get-GitLine @('-C', $script:LocalSrc, 'config', '--get', 'remote.origin.url')
         if (-not $script:OriginUrl) {
@@ -192,7 +191,6 @@ function Find-Source {
             $script:OriginUrl = $RepoUrl
         }
         Write-Info "Installing from local checkout $($script:LocalSrc) (origin $($script:OriginUrl))."
-        Write-SourceBranchWarnings
     } else {
         $script:FetchUrl = $RepoUrl
         $script:OriginUrl = $RepoUrl
@@ -284,29 +282,59 @@ function Invoke-Clone {
     }
 }
 
+# $true when the local source checkout is the target itself.
+function Test-InPlace {
+    if (-not $script:LocalSrc) { return $false }
+    if (-not (Test-Path -LiteralPath (Join-Path $script:Target '.git'))) { return $false }
+    $targetTop = Get-GitLine @('-C', $script:Target, 'rev-parse', '--show-toplevel')
+    return [bool]($targetTop -and (Test-SamePath $targetTop $script:LocalSrc))
+}
+
+# Check a local source clone's master before bootstrap installs it; an in-place
+# run installs nothing from it, so it is skipped.
+function Confirm-Source {
+    if (-not $script:LocalSrc) { return }
+    if (Test-InPlace) { return }
+    Assert-SourceMaster
+    Write-SourceBranchWarnings
+}
+
+# $true when the target's .git has an unborn HEAD and no local branches: an
+# adopt stopped before its reset, with no history to lose.
+function Test-UnfinishedAdopt {
+    Invoke-Quiet 'git' @('-C', $script:Target, 'rev-parse', '--verify', '-q', 'HEAD') | Out-Null
+    if ($script:NativeExit -eq 0) { return $false }
+    $branches = @(Invoke-Quiet 'git' @('-C', $script:Target, 'for-each-ref', 'refs/heads') | Where-Object { $_ })
+    return ($branches.Count -eq 0)
+}
+
+function Restart-Adopt {
+    $T = $script:Target
+    Write-Warn "Found an unfinished adopt in ${T}: starting it again."
+    Remove-Item -LiteralPath (Join-Path $T '.git') -Recurse -Force -ErrorAction SilentlyContinue
+    Invoke-Adopt
+}
+
 function Invoke-Bootstrap {
     $T = $script:Target
-    $isRepo = Test-Path -LiteralPath (Join-Path $T '.git')
-    if ($script:LocalSrc -and $isRepo) {
-        $targetTop = Get-GitLine @('-C', $T, 'rev-parse', '--show-toplevel')
-        if ($targetTop -and (Test-SamePath $targetTop $script:LocalSrc)) {
-            Write-Info "Running from the checkout at $T - using it in place."
-            return
-        }
+    if (Test-InPlace) {
+        Write-Info "Running from the checkout at $T - using it in place."
+        return
     }
-    if ($isRepo) {
+    if (Test-Path -LiteralPath (Join-Path $T '.git')) {
         $origin = Get-GitLine @('-C', $T, 'config', '--get', 'remote.origin.url')
         if ($origin -and ((Normalize-Url $origin) -eq (Normalize-Url $script:OriginUrl))) {
-            Invoke-Quiet 'git' @('-C', $T, 'rev-parse', '--verify', '-q', 'HEAD') | Out-Null
-            $unborn = ($script:NativeExit -ne 0)
-            $branches = @(Invoke-Quiet 'git' @('-C', $T, 'for-each-ref', 'refs/heads') | Where-Object { $_ })
-            if ($unborn -and $branches.Count -eq 0) {
-                Write-Warn "Found an unfinished adopt in ${T}: starting it again."
-                Remove-Item -LiteralPath (Join-Path $T '.git') -Recurse -Force -ErrorAction SilentlyContinue
-                Invoke-Adopt
+            if (Test-UnfinishedAdopt) {
+                Restart-Adopt
                 return
             }
             Update-Existing $origin
+            return
+        }
+        # An adopt from a clone elsewhere stopped before remote set-url: origin
+        # is still that clone's path.
+        if ($script:LocalSrc -and $origin -and (Test-SamePath $origin $script:LocalSrc) -and (Test-UnfinishedAdopt)) {
+            Restart-Adopt
             return
         }
         if (-not $origin) { $origin = 'none' }
@@ -590,6 +618,7 @@ function Write-Summary {
 Install-Deps
 Find-Source
 Resolve-Target
+Confirm-Source
 Invoke-Bootstrap
 Initialize-LocalMd
 Set-RepoIdentity

@@ -184,7 +184,6 @@ find_source() {
         fi
     fi
     if [ -n "$LOCAL_SRC" ]; then
-        check_source_master
         FETCH_URL=$LOCAL_SRC
         ORIGIN_URL=$(git -C "$LOCAL_SRC" config --get remote.origin.url 2>/dev/null) || ORIGIN_URL=""
         if [ -z "$ORIGIN_URL" ]; then
@@ -192,7 +191,6 @@ find_source() {
             ORIGIN_URL=$REPO_URL
         fi
         info "Installing from local checkout $LOCAL_SRC (origin $ORIGIN_URL)."
-        warn_source_branch
     else
         FETCH_URL=$REPO_URL
         ORIGIN_URL=$REPO_URL
@@ -211,6 +209,21 @@ resolve_target() {
         TARGET="$HOME/.claude"
     fi
     info "Target: $TARGET"
+}
+
+# in_place - true when the local source checkout is the target itself.
+in_place() {
+    if [ -z "$LOCAL_SRC" ] || [ ! -e "$TARGET/.git" ]; then return 1; fi
+    target_top=$(git -C "$TARGET" rev-parse --show-toplevel 2>/dev/null) || target_top=""
+    [ -n "$target_top" ] && same_path "$target_top" "$LOCAL_SRC"
+}
+
+# check_source - check a local source clone's master before bootstrap installs
+# it; an in-place run installs nothing from it, so it is skipped.
+check_source() {
+    if [ -z "$LOCAL_SRC" ] || in_place; then return 0; fi
+    check_source_master
+    warn_source_branch
 }
 
 # --- bootstrap --------------------------------------------------------------
@@ -273,24 +286,38 @@ clone_fresh() {
     fi
 }
 
+# unfinished_adopt - true when the target's .git has an unborn HEAD and no
+# local branches: an adopt stopped before its reset, with no history to lose.
+unfinished_adopt() {
+    if git -C "$TARGET" rev-parse --verify -q HEAD >/dev/null 2>&1; then return 1; fi
+    [ -z "$(git -C "$TARGET" for-each-ref refs/heads)" ]
+}
+
+restart_adopt() {
+    warn "Found an unfinished adopt in $TARGET: starting it again."
+    rm -rf "$TARGET/.git"
+    adopt_existing
+}
+
 bootstrap() {
-    if [ -n "$LOCAL_SRC" ] && [ -e "$TARGET/.git" ]; then
-        target_top=$(git -C "$TARGET" rev-parse --show-toplevel 2>/dev/null) || target_top=""
-        if [ -n "$target_top" ] && same_path "$target_top" "$LOCAL_SRC"; then
-            info "Running from the checkout at $TARGET - using it in place."
-            return 0
-        fi
+    if in_place; then
+        info "Running from the checkout at $TARGET - using it in place."
+        return 0
     fi
     if [ -e "$TARGET/.git" ]; then
         origin=$(git -C "$TARGET" config --get remote.origin.url 2>/dev/null) || origin=""
         if [ -n "$origin" ] && same_url "$origin" "$ORIGIN_URL"; then
-            if ! git -C "$TARGET" rev-parse --verify -q HEAD >/dev/null 2>&1 && [ -z "$(git -C "$TARGET" for-each-ref refs/heads)" ]; then
-                warn "Found an unfinished adopt in $TARGET: starting it again."
-                rm -rf "$TARGET/.git"
-                adopt_existing
+            if unfinished_adopt; then
+                restart_adopt
                 return 0
             fi
             update_existing
+            return 0
+        fi
+        # An adopt from a clone elsewhere stopped before remote set-url: origin
+        # is still that clone's path.
+        if [ -n "$LOCAL_SRC" ] && [ -n "$origin" ] && same_path "$origin" "$LOCAL_SRC" && unfinished_adopt; then
+            restart_adopt
             return 0
         fi
         die "$TARGET is a git repo with a different origin (${origin:-none}). Move it aside or set CLAUDE_CONFIG_DIR, then re-run. Nothing was changed."
@@ -616,6 +643,7 @@ summary() {
 install_deps
 find_source
 resolve_target
+check_source
 bootstrap
 setup_local_md
 setup_identity
