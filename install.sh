@@ -387,6 +387,67 @@ setup_identity() {
     fi
 }
 
+# --- checks -----------------------------------------------------------------
+MANAGED_KEYS_PY='
+import json, sys
+KEYS = ("allowManagedHooksOnly", "allowManagedPermissionRulesOnly", "disableAllHooks", "hooks",
+        "statusLine", "enabledPlugins", "extraKnownMarketplaces", "strictKnownMarketplaces",
+        "blockedMarketplaces")
+try:
+    with open(sys.argv[1], encoding="utf-8-sig") as f:
+        data = json.load(f)
+except Exception:
+    sys.stdout.buffer.write(b"!unreadable\n")
+    sys.exit(0)
+found = [k for k in KEYS if isinstance(data, dict) and k in data]
+sys.stdout.buffer.write((", ".join(found) + "\n").encode("utf-8"))
+'
+
+managed_paths() {
+    if [ -n "${ABC_CLAUDE_MANAGED_PATHS:-}" ]; then
+        printf '%s\n' "$ABC_CLAUDE_MANAGED_PATHS" | tr ';' '\n'
+    elif [ "$IS_WINDOWS" = 1 ]; then
+        printf '%s\n' 'C:\Program Files\ClaudeCode\managed-settings.json'
+    elif [ "$(uname -s)" = Darwin ]; then
+        printf '%s\n' '/Library/Application Support/ClaudeCode/managed-settings.json'
+    else
+        printf '%s\n' '/etc/claude-code/managed-settings.json'
+    fi
+}
+
+report_managed() {
+    paths=$(managed_paths)
+    found=0
+    set -f; old_ifs=$IFS; IFS=$NL
+    for managed in $paths; do
+        if [ -z "$managed" ]; then continue; fi
+        managed_file=$(posix_path "$managed")
+        if [ ! -f "$managed_file" ]; then continue; fi
+        found=1
+        warn "Managed settings found: $managed"
+        keys=$("$PY" -c "$MANAGED_KEYS_PY" "$managed_file") || keys="!unreadable"
+        if [ "$keys" = "!unreadable" ]; then
+            warn "Could not parse $managed as JSON."
+        elif [ -n "$keys" ]; then
+            warn "Managed keys that affect this config: $keys"
+        else
+            info "No managed keys that affect this config."
+        fi
+    done
+    IFS=$old_ifs; set +f
+    if [ "$found" = 0 ]; then info "No managed settings found."; fi
+}
+
+check_python() {
+    if have python && python --version >/dev/null 2>&1; then
+        info "python resolves: $(python --version 2>&1 | tr -d '\r')."
+    elif have python3; then
+        warn "Only python3 is on PATH, but the hooks and the statusline run 'python'. Fix: install python-is-python3 (Debian/Ubuntu) or put a 'python' link to python3 on PATH."
+    else
+        warn "python is not on PATH: the hooks and the statusline need it."
+    fi
+}
+
 # --- summary ----------------------------------------------------------------
 summary() {
     if [ -n "$BACKUPS" ]; then
@@ -410,4 +471,6 @@ resolve_target
 bootstrap
 setup_local_md
 setup_identity
+report_managed
+check_python
 summary

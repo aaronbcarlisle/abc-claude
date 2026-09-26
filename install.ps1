@@ -380,6 +380,63 @@ function Set-RepoIdentity {
     }
 }
 
+# --- checks -----------------------------------------------------------------
+$ManagedKeys = @('allowManagedHooksOnly', 'allowManagedPermissionRulesOnly', 'disableAllHooks', 'hooks',
+                 'statusLine', 'enabledPlugins', 'extraKnownMarketplaces', 'strictKnownMarketplaces',
+                 'blockedMarketplaces')
+
+function Get-ManagedPaths {
+    if ($env:ABC_CLAUDE_MANAGED_PATHS) { return @($env:ABC_CLAUDE_MANAGED_PATHS -split ';' | Where-Object { $_ }) }
+    return @('C:\Program Files\ClaudeCode\managed-settings.json')
+}
+
+function Write-ManagedReport {
+    $found = $false
+    foreach ($managed in (Get-ManagedPaths)) {
+        if (-not (Test-Path -LiteralPath $managed -PathType Leaf)) { continue }
+        $found = $true
+        Write-Warn "Managed settings found: $managed"
+        try {
+            $data = Get-Content -LiteralPath $managed -Raw -Encoding UTF8 | ConvertFrom-Json
+        } catch {
+            Write-Warn "Could not parse $managed as JSON."
+            continue
+        }
+        $names = @()
+        if ($data) { $names = @($data.PSObject.Properties | ForEach-Object { $_.Name }) }
+        $keys = @($ManagedKeys | Where-Object { $names -contains $_ })
+        if ($keys.Count -gt 0) { Write-Warn "Managed keys that affect this config: $($keys -join ', ')" }
+        else { Write-Info 'No managed keys that affect this config.' }
+    }
+    if (-not $found) { Write-Info 'No managed settings found.' }
+}
+
+# Git for Windows' bin\bash.exe, found from `git --exec-path`, or $null.
+function Find-GitBash {
+    $exec = Get-GitLine @('--exec-path')
+    if (-not $exec) { return $null }
+    $root = Split-Path (Split-Path (Split-Path $exec -Parent) -Parent) -Parent
+    $bash = Join-Path $root 'bin\bash.exe'
+    if (Test-Path -LiteralPath $bash) { return $bash }
+    return $null
+}
+
+function Test-PythonFromBash {
+    $bash = Find-GitBash
+    if (-not $bash) { Write-Warn 'Git Bash not found: cannot check that python resolves from bash.'; return }
+    $version = @(Invoke-Quiet $bash @('-c', 'python --version 2>&1') | Where-Object { $_ })
+    if ($script:NativeExit -eq 0 -and $version.Count -gt 0) {
+        Write-Info "python resolves: $(([string]$version[0]).Trim())."
+        return
+    }
+    Invoke-Quiet $bash @('-c', 'command -v python3') | Out-Null
+    if ($script:NativeExit -eq 0) {
+        Write-Warn "Only python3 is on PATH, but the hooks and the statusline run 'python'. Fix: install python-is-python3 (Debian/Ubuntu) or put a 'python' link to python3 on PATH."
+    } else {
+        Write-Warn 'python is not on PATH: the hooks and the statusline need it.'
+    }
+}
+
 # --- summary ----------------------------------------------------------------
 function Write-Summary {
     if ($script:Backups.Count -gt 0) {
@@ -403,5 +460,7 @@ Resolve-Target
 Invoke-Bootstrap
 Initialize-LocalMd
 Set-RepoIdentity
+Write-ManagedReport
+Test-PythonFromBash
 Write-Summary
 exit 0

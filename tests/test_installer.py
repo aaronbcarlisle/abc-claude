@@ -291,6 +291,30 @@ class InstallerScenarios:
         local = h.git("-C", str(self.sb.target), "config", "--local", "--get", "user.name", check=False)
         self.assertEqual(local.strip(), "")
 
+    # --- task 8: checks -----------------------------------------------------
+    def test_no_managed_settings(self):
+        result = self.install("--yes")
+        self.assertIn("No managed settings found.", result.output)
+        self.assertIn("python resolves: Python ", result.output)
+
+    def test_managed_settings_reported_with_affected_keys(self):
+        managed = self.sb.root / "managed-settings.json"
+        managed.write_text(json.dumps({"companyAnnouncements": ["hi"], "statusLine": {"type": "command"},
+                                       "allowManagedHooksOnly": True}), encoding="utf-8")
+        paths = str(self.sb.no_managed) + ";" + str(managed)
+        result = self.install("--yes", env=self.sb.env(ABC_CLAUDE_MANAGED_PATHS=paths))
+        self.assertOk(result)
+        self.assertIn("Managed settings found: " + str(managed), result.output)
+        self.assertIn("Managed keys that affect this config: allowManagedHooksOnly, statusLine\n", result.output)
+        self.assertNotIn("companyAnnouncements", result.output)
+
+    def test_unparseable_managed_settings_is_a_warning(self):
+        managed = self.sb.root / "managed-settings.json"
+        managed.write_text("{not json", encoding="utf-8")
+        result = self.install("--yes", env=self.sb.env(ABC_CLAUDE_MANAGED_PATHS=managed))
+        self.assertOk(result)
+        self.assertIn("Could not parse " + str(managed) + " as JSON.", result.output)
+
 
 class ShTests(InstallerScenarios, unittest.TestCase):
     INTERP = "sh"
