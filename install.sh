@@ -186,6 +186,92 @@ resolve_target() {
     info "Target: $TARGET"
 }
 
+# --- bootstrap --------------------------------------------------------------
+# norm_url URL - compare form: slashes, lowercase, no scheme, user, trailing / or .git.
+norm_url() {
+    printf '%s\n' "$1" | tr '\\' '/' | tr '[:upper:]' '[:lower:]' | sed \
+        -e 's#/*$##' -e 's#\.git$##' -e 's#^[a-z+]*://##' -e 's#^[^/@]*@##' -e 's#^\([^/:]*\):#\1/#'
+}
+
+same_url() { [ "$(norm_url "$1")" = "$(norm_url "$2")" ]; }
+
+SIGN_IN_HINT="Sign in first (gh auth login, or Git Credential Manager), then re-run."
+
+# check_remote URL die|warn - git ls-remote access check.
+check_remote() {
+    if git ls-remote "$1" >/dev/null 2>&1; then return 0; fi
+    if [ "$2" = die ]; then die "Cannot reach $1. $SIGN_IN_HINT"; fi
+    warn "Cannot reach $1. $SIGN_IN_HINT"
+    return 1
+}
+
+restore_missing() {
+    missing=$(git -C "$TARGET" -c core.quotepath=off ls-files -d) || missing=""
+    if [ -z "$missing" ]; then return 0; fi
+    count=0
+    set -f; old_ifs=$IFS; IFS=$NL
+    for f in $missing; do
+        git -C "$TARGET" checkout -- "$f" || die "Could not restore $f (a running Claude Code session may hold it open). Close Claude Code and re-run."
+        count=$((count + 1))
+    done
+    IFS=$old_ifs; set +f
+    info "Restored $count missing tracked file(s)."
+}
+
+update_existing() {
+    info "$TARGET is an abc-claude checkout - updating it."
+    info "Close running Claude Code sessions first: they can hold files open."
+    restore_missing
+    if [ -n "$(git -C "$TARGET" status --porcelain --untracked-files=no)" ]; then
+        warn "Tracked files in $TARGET have local changes - skipping the pull. Commit or discard them, then re-run."
+        return 0
+    fi
+    if check_remote "$ORIGIN_URL" warn; then
+        git -C "$TARGET" pull --ff-only || warn "Could not fast-forward $TARGET; leaving it as-is."
+    fi
+}
+
+warn_uncommitted_source() {
+    if [ -n "$LOCAL_SRC" ] && [ -n "$(git -C "$LOCAL_SRC" status --porcelain)" ]; then
+        warn "$LOCAL_SRC has uncommitted edits: they are not carried over. Commit them, then re-run."
+    fi
+}
+
+clone_fresh() {
+    check_remote "$FETCH_URL" die
+    info "Cloning into $TARGET."
+    git clone -q -c core.autocrlf=false --branch master "$FETCH_URL" "$TARGET" || die "git clone of $FETCH_URL failed."
+    if [ "$FETCH_URL" != "$ORIGIN_URL" ]; then
+        git -C "$TARGET" remote set-url origin "$ORIGIN_URL"
+    fi
+}
+
+bootstrap() {
+    if [ -n "$LOCAL_SRC" ] && [ -e "$TARGET/.git" ]; then
+        target_top=$(git -C "$TARGET" rev-parse --show-toplevel 2>/dev/null) || target_top=""
+        if [ -n "$target_top" ] && same_path "$target_top" "$LOCAL_SRC"; then
+            info "Running from the checkout at $TARGET - using it in place."
+            return 0
+        fi
+    fi
+    if [ -e "$TARGET/.git" ]; then
+        origin=$(git -C "$TARGET" config --get remote.origin.url 2>/dev/null) || origin=""
+        if [ -n "$origin" ] && same_url "$origin" "$ORIGIN_URL"; then
+            update_existing
+            return 0
+        fi
+        die "$TARGET is a git repo with a different origin (${origin:-none}). Move it aside or set CLAUDE_CONFIG_DIR, then re-run. Nothing was changed."
+    fi
+    if [ -e "$TARGET" ] && [ ! -d "$TARGET" ]; then
+        die "$TARGET exists and is not a directory. Move it aside, then re-run."
+    fi
+    if [ -d "$TARGET" ]; then
+        die "$TARGET exists and is not a git repo. Move it aside, then re-run. Nothing was changed."
+    fi
+    warn_uncommitted_source
+    clone_fresh
+}
+
 # --- summary ----------------------------------------------------------------
 summary() {
     if [ -n "$BACKUPS" ]; then
@@ -206,4 +292,5 @@ summary() {
 install_deps
 find_source
 resolve_target
+bootstrap
 summary

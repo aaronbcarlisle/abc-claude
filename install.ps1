@@ -184,6 +184,101 @@ function Resolve-Target {
     Write-Info "Target: $($script:Target)"
 }
 
+# --- bootstrap --------------------------------------------------------------
+# Compare form of a URL: slashes, lowercase, no scheme, user, trailing / or .git.
+function Normalize-Url($u) {
+    $s = ([string]$u -replace '\\', '/').ToLowerInvariant()
+    $s = $s -replace '/+$', ''
+    $s = $s -replace '\.git$', ''
+    $s = $s -replace '^[a-z+]*://', ''
+    $s = $s -replace '^[^/@]*@', ''
+    $s = $s -replace '^([^/:]*):', '$1/'
+    return $s
+}
+
+$SignInHint = 'Sign in first (gh auth login, or Git Credential Manager), then re-run.'
+
+# git ls-remote access check; -Fatal exits 1, otherwise warns and returns $false.
+function Test-Remote($Url, [switch]$Fatal) {
+    Invoke-Quiet 'git' @('ls-remote', $Url) | Out-Null
+    if ($script:NativeExit -eq 0) { return $true }
+    if ($Fatal) { Fail "Cannot reach $Url. $SignInHint" }
+    Write-Warn "Cannot reach $Url. $SignInHint"
+    return $false
+}
+
+function Restore-Missing {
+    $T = $script:Target
+    $missing = @(Invoke-Quiet 'git' @('-C', $T, '-c', 'core.quotepath=off', 'ls-files', '-d') | Where-Object { $_ })
+    if ($missing.Count -eq 0) { return }
+    foreach ($f in $missing) {
+        if (-not (Invoke-Git @('-C', $T, 'checkout', '--', $f))) {
+            Fail "Could not restore $f (a running Claude Code session may hold it open). Close Claude Code and re-run."
+        }
+    }
+    Write-Info "Restored $($missing.Count) missing tracked file(s)."
+}
+
+function Update-Existing {
+    $T = $script:Target
+    Write-Info "$T is an abc-claude checkout - updating it."
+    Write-Info 'Close running Claude Code sessions first: they can hold files open.'
+    Restore-Missing
+    $dirty = @(Invoke-Quiet 'git' @('-C', $T, 'status', '--porcelain', '--untracked-files=no') | Where-Object { $_ })
+    if ($dirty.Count -gt 0) {
+        Write-Warn "Tracked files in $T have local changes - skipping the pull. Commit or discard them, then re-run."
+        return
+    }
+    if (Test-Remote $script:OriginUrl) {
+        if (-not (Invoke-Git @('-C', $T, 'pull', '--ff-only'))) { Write-Warn "Could not fast-forward $T; leaving it as-is." }
+    }
+}
+
+function Warn-UncommittedSource {
+    if (-not $script:LocalSrc) { return }
+    $dirty = @(Invoke-Quiet 'git' @('-C', $script:LocalSrc, 'status', '--porcelain') | Where-Object { $_ })
+    if ($dirty.Count -gt 0) {
+        Write-Warn "$($script:LocalSrc) has uncommitted edits: they are not carried over. Commit them, then re-run."
+    }
+}
+
+function Invoke-Clone {
+    $T = $script:Target
+    Test-Remote $script:FetchUrl -Fatal | Out-Null
+    Write-Info "Cloning into $T."
+    if (-not (Invoke-Git @('clone', '-q', '-c', 'core.autocrlf=false', '--branch', 'master', $script:FetchUrl, $T))) {
+        Fail "git clone of $($script:FetchUrl) failed."
+    }
+    if ($script:FetchUrl -ne $script:OriginUrl) {
+        Invoke-Git @('-C', $T, 'remote', 'set-url', 'origin', $script:OriginUrl) | Out-Null
+    }
+}
+
+function Invoke-Bootstrap {
+    $T = $script:Target
+    $isRepo = Test-Path -LiteralPath (Join-Path $T '.git')
+    if ($script:LocalSrc -and $isRepo) {
+        $targetTop = Get-GitLine @('-C', $T, 'rev-parse', '--show-toplevel')
+        if ($targetTop -and (Test-SamePath $targetTop $script:LocalSrc)) {
+            Write-Info "Running from the checkout at $T - using it in place."
+            return
+        }
+    }
+    if ($isRepo) {
+        $origin = Get-GitLine @('-C', $T, 'config', '--get', 'remote.origin.url')
+        if ($origin -and ((Normalize-Url $origin) -eq (Normalize-Url $script:OriginUrl))) {
+            Update-Existing
+            return
+        }
+        if (-not $origin) { $origin = 'none' }
+        Fail "$T is a git repo with a different origin ($origin). Move it aside or set CLAUDE_CONFIG_DIR, then re-run. Nothing was changed."
+    }
+    if (Test-Path -LiteralPath $T -PathType Leaf) { Fail "$T exists and is not a directory. Move it aside, then re-run." }
+    if (Test-Path -LiteralPath $T) { Fail "$T exists and is not a git repo. Move it aside, then re-run. Nothing was changed." }
+    Warn-UncommittedSource
+    Invoke-Clone
+}
+
 # --- summary ----------------------------------------------------------------
 function Write-Summary {
     if ($script:Backups.Count -gt 0) {
@@ -204,5 +299,6 @@ function Write-Summary {
 Install-Deps
 Find-Source
 Resolve-Target
+Invoke-Bootstrap
 Write-Summary
 exit 0
