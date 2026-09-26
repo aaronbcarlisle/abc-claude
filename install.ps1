@@ -343,6 +343,43 @@ function Invoke-Adopt {
     Write-Info "Adopted $T."
 }
 
+# --- machine-local ----------------------------------------------------------
+$NoAdminLine = "No admin rights or Developer Mode here: don't suggest elevated installs, symlinks or HKLM edits."
+
+function Initialize-LocalMd {
+    $localMd = Join-Path $script:Target 'rules\local.md'
+    $template = Join-Path $script:Target 'templates\local.md'
+    if (Test-Path -LiteralPath $localMd) { Write-Info 'rules/local.md exists - leaving it unchanged.'; return }
+    if (-not (Test-Path -LiteralPath $template)) { Write-Warn 'templates/local.md is missing - skipping rules/local.md.'; return }
+    $label = Ask 'Machine label' ([System.Net.Dns]::GetHostName())
+    $admin = Ask 'Admin rights or Developer Mode available? (y/n)' 'y'
+    $adminLine = if ($admin -match '^[Nn]') { $NoAdminLine } else { '' }
+    $out = @(foreach ($line in (Get-Content -LiteralPath $template -Encoding UTF8)) {
+        if ($line -eq '{{MACHINE_LINE}}') { "This machine: $label." }
+        elseif ($line -eq '{{ADMIN_LINE}}') { if ($adminLine) { $adminLine } }
+        else { $line }
+    })
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $localMd) | Out-Null
+    [System.IO.File]::WriteAllText($localMd, (($out -join "`n") + "`n"), (New-Object System.Text.UTF8Encoding($false)))
+    Write-Info 'Created rules/local.md.'
+}
+
+function Set-RepoIdentity {
+    $T = $script:Target
+    $name = Get-GitLine @('-C', $T, 'config', '--local', '--get', 'user.name')
+    $email = Get-GitLine @('-C', $T, 'config', '--local', '--get', 'user.email')
+    if ($name -and $email) { Write-Info "Git identity for this repo: $name <$email>."; return }
+    if (-not $name) { $name = Ask 'Git user.name for this repo' (Get-GitLine @('config', '--global', '--get', 'user.name')) }
+    if (-not $email) { $email = Ask 'Git user.email for this repo' (Get-GitLine @('config', '--global', '--get', 'user.email')) }
+    if ($name) { Invoke-Git @('-C', $T, 'config', 'user.name', $name) | Out-Null }
+    if ($email) { Invoke-Git @('-C', $T, 'config', 'user.email', $email) | Out-Null }
+    if ($name -and $email) {
+        Write-Info "Git identity for this repo: $name <$email>."
+    } else {
+        Write-Warn "Git identity for this repo is not set: run git -C `"$T`" config user.name `"Your Name`" and git -C `"$T`" config user.email you@example.com."
+    }
+}
+
 # --- summary ----------------------------------------------------------------
 function Write-Summary {
     if ($script:Backups.Count -gt 0) {
@@ -364,5 +401,7 @@ Install-Deps
 Find-Source
 Resolve-Target
 Invoke-Bootstrap
+Initialize-LocalMd
+Set-RepoIdentity
 Write-Summary
 exit 0

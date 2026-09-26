@@ -333,6 +333,60 @@ adopt_existing() {
     info "Adopted $TARGET."
 }
 
+# --- machine-local ----------------------------------------------------------
+NO_ADMIN_LINE="No admin rights or Developer Mode here: don't suggest elevated installs, symlinks or HKLM edits."
+
+setup_local_md() {
+    local_md="$TARGET/rules/local.md"
+    template="$TARGET/templates/local.md"
+    if [ -e "$local_md" ]; then
+        info "rules/local.md exists - leaving it unchanged."
+        return 0
+    fi
+    if [ ! -f "$template" ]; then
+        warn "templates/local.md is missing - skipping rules/local.md."
+        return 0
+    fi
+    host=$(hostname 2>/dev/null | tr -d '\r') || host=""
+    if [ -z "$host" ]; then host=$(uname -n); fi
+    label=$(ask "Machine label" "$host")
+    admin=$(ask "Admin rights or Developer Mode available? (y/n)" "y")
+    admin_line=""
+    case "$admin" in
+        [Nn]*) admin_line=$NO_ADMIN_LINE ;;
+    esac
+    mkdir -p "$TARGET/rules"
+    awk -v m="This machine: $label." -v a="$admin_line" '
+        $0 == "{{MACHINE_LINE}}" { print m; next }
+        $0 == "{{ADMIN_LINE}}" { if (a != "") print a; next }
+        { print }' "$template" > "$local_md"
+    info "Created rules/local.md."
+}
+
+setup_identity() {
+    name=$(git -C "$TARGET" config --local --get user.name 2>/dev/null) || name=""
+    email=$(git -C "$TARGET" config --local --get user.email 2>/dev/null) || email=""
+    if [ -n "$name" ] && [ -n "$email" ]; then
+        info "Git identity for this repo: $name <$email>."
+        return 0
+    fi
+    if [ -z "$name" ]; then
+        global_name=$(git config --global --get user.name 2>/dev/null) || global_name=""
+        name=$(ask "Git user.name for this repo" "$global_name")
+    fi
+    if [ -z "$email" ]; then
+        global_email=$(git config --global --get user.email 2>/dev/null) || global_email=""
+        email=$(ask "Git user.email for this repo" "$global_email")
+    fi
+    if [ -n "$name" ]; then git -C "$TARGET" config user.name "$name"; fi
+    if [ -n "$email" ]; then git -C "$TARGET" config user.email "$email"; fi
+    if [ -n "$name" ] && [ -n "$email" ]; then
+        info "Git identity for this repo: $name <$email>."
+    else
+        warn "Git identity for this repo is not set: run git -C \"$TARGET\" config user.name \"Your Name\" and git -C \"$TARGET\" config user.email you@example.com."
+    fi
+}
+
 # --- summary ----------------------------------------------------------------
 summary() {
     if [ -n "$BACKUPS" ]; then
@@ -354,4 +408,6 @@ install_deps
 find_source
 resolve_target
 bootstrap
+setup_local_md
+setup_identity
 summary

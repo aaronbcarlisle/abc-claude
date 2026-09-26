@@ -250,6 +250,47 @@ class InstallerScenarios:
         self.assertFalse((self.sb.target / ".git").exists())
         self.assertEqual((self.sb.target / "settings.json").read_bytes(), b"{}\n")
 
+    # --- task 7: machine-local ----------------------------------------------
+    def test_local_md_created_from_template_under_yes(self):
+        self.assertOk(self.install("--yes"))
+        text = (self.sb.target / "rules" / "local.md").read_bytes().decode("utf-8")
+        self.assertNotIn("\r", text)
+        self.assertNotIn("{{", text)
+        self.assertRegex(text, r"(?m)^This machine: \S.*\.$")
+        self.assertNotIn("No admin rights", text)
+        self.assertEqual(self.target_git("status", "--porcelain"), "")
+
+    def test_local_md_prompts_use_answers(self):
+        result = self.install(stdin="Work laptop\nn\n")
+        self.assertOk(result)
+        text = (self.sb.target / "rules" / "local.md").read_text(encoding="utf-8")
+        self.assertIn("This machine: Work laptop.\n", text)
+        self.assertIn("No admin rights or Developer Mode here: don't suggest elevated installs, symlinks "
+                      "or HKLM edits.\n", text)
+
+    def test_existing_local_md_is_unchanged(self):
+        self.sb.target.mkdir()
+        h.Sandbox.write_files(self.sb.target, {"rules/local.md": b"# Mine\r\nkeep me\r\n"})
+        result = self.install("--yes")
+        self.assertOk(result)
+        self.assertEqual((self.sb.target / "rules" / "local.md").read_bytes(), b"# Mine\r\nkeep me\r\n")
+        self.assertIn("rules/local.md exists - leaving it unchanged.", result.output)
+
+    def test_git_identity_from_global_config(self):
+        result = self.install("--yes")
+        self.assertOk(result)
+        self.assertEqual(self.target_git("config", "--local", "user.name"), "Test User")
+        self.assertEqual(self.target_git("config", "--local", "user.email"), "test@example.com")
+        self.assertIn("Git identity for this repo: Test User <test@example.com>.", result.output)
+
+    def test_git_identity_left_unset_with_warning(self):
+        self.sb.set_global_identity(None, None)
+        result = self.install("--yes")
+        self.assertOk(result)
+        self.assertIn("Git identity for this repo is not set", result.output)
+        local = h.git("-C", str(self.sb.target), "config", "--local", "--get", "user.name", check=False)
+        self.assertEqual(local.strip(), "")
+
 
 class ShTests(InstallerScenarios, unittest.TestCase):
     INTERP = "sh"
