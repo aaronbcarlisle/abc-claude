@@ -257,6 +257,12 @@ bootstrap() {
     if [ -e "$TARGET/.git" ]; then
         origin=$(git -C "$TARGET" config --get remote.origin.url 2>/dev/null) || origin=""
         if [ -n "$origin" ] && same_url "$origin" "$ORIGIN_URL"; then
+            if ! git -C "$TARGET" rev-parse --verify -q HEAD >/dev/null 2>&1; then
+                warn "Found an unfinished adopt in $TARGET: starting it again."
+                rm -rf "$TARGET/.git"
+                adopt_existing
+                return 0
+            fi
             update_existing
             return 0
         fi
@@ -313,13 +319,13 @@ adopt_existing() {
     check_remote "$FETCH_URL" die
     warn "Adopting the existing $TARGET: close running Claude Code sessions first, since they can hold files open."
     git -C "$TARGET" init -q -b master || abort_adopt "git init failed in $TARGET."
-    git -C "$TARGET" config core.autocrlf false
+    git -C "$TARGET" config core.autocrlf false || abort_adopt "git config failed in $TARGET."
     git -C "$TARGET" remote add origin "$FETCH_URL" || abort_adopt "git remote add failed."
     git -C "$TARGET" fetch -q origin || abort_adopt "git fetch from $FETCH_URL failed."
     git -C "$TARGET" reset -q origin/master || abort_adopt "git reset to origin/master failed."
     git -C "$TARGET" branch -q -u origin/master || abort_adopt "git branch -u origin/master failed."
     if [ "$FETCH_URL" != "$ORIGIN_URL" ]; then
-        git -C "$TARGET" remote set-url origin "$ORIGIN_URL"
+        git -C "$TARGET" remote set-url origin "$ORIGIN_URL" || abort_adopt "git remote set-url failed."
     fi
     backup_conflicts
     git -C "$TARGET" checkout -- . || die "git checkout failed partway (a running Claude Code session may hold a file open). Close Claude Code and re-run: the re-run restores the missing files."

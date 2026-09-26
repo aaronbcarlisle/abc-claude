@@ -190,6 +190,8 @@ class InstallerScenarios:
         self.assertIn("    rules/mine.md", result.output)
         self.assertNotIn("history.jsonl", result.output)
         self.assertIn("    " + baks[0], result.output)
+        self.assertIn("Rewrote 1 tracked file(s)", result.output)
+        self.assertIn("Adopted ", result.output)
         self.assertEqual(self.target_git("status", "--porcelain"), "?? rules/mine.md")
         self.assertEqual(self.target_git("rev-parse", "--abbrev-ref", "@{u}"), "origin/master")
 
@@ -199,6 +201,28 @@ class InstallerScenarios:
         first = h.backups(self.sb.target)
         self.assertOk(self.install("--yes"))
         self.assertEqual(h.backups(self.sb.target), first)
+
+    def test_rerun_after_interrupted_adopt_recovers(self):
+        files = self.seed_existing_target()
+        t = self.sb.target
+        h.git("init", "-q", "-b", "master", cwd=t)
+        h.git("remote", "add", "origin", str(self.sb.remote), cwd=t)
+        result = self.install("--yes")
+        self.assertOk(result)
+        self.assertIn("Found an unfinished adopt in ", result.output)
+        self.assertIn(": starting it again.", result.output)
+        baks = h.backups(t)
+        self.assertEqual(len(baks), 1, baks)
+        self.assertTrue(re.fullmatch(r"settings\.json\.bak\.\d{14}", baks[0]), baks)
+        self.assertEqual((t / baks[0]).read_bytes(), files["settings.json"])
+        for rel in ("history.jsonl", "projects/p/memory/MEMORY.md", "skills/synced/x/SKILL.md", "rules/mine.md"):
+            self.assertEqual((t / rel).read_bytes(), files[rel], rel)
+        for rel in h.tracked_files(t):
+            self.assertNotIn(b"\r\n", (t / rel).read_bytes(), rel)
+        self.assertEqual((t / "CLAUDE.md").read_bytes(), b"# Fixture global rules\n")
+        self.assertEqual(self.target_git("rev-parse", "--abbrev-ref", "@{u}"), "origin/master")
+        # HEAD is born: rev-parse --verify raises via h.git's check=True if not.
+        self.assertNotEqual(self.target_git("rev-parse", "--verify", "HEAD"), "")
 
     def test_run_from_clone_elsewhere_adopts_with_clone_origin(self):
         clone = self.sb.root / "clone"

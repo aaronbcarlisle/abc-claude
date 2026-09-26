@@ -267,6 +267,13 @@ function Invoke-Bootstrap {
     if ($isRepo) {
         $origin = Get-GitLine @('-C', $T, 'config', '--get', 'remote.origin.url')
         if ($origin -and ((Normalize-Url $origin) -eq (Normalize-Url $script:OriginUrl))) {
+            Invoke-Quiet 'git' @('-C', $T, 'rev-parse', '--verify', '-q', 'HEAD') | Out-Null
+            if ($script:NativeExit -ne 0) {
+                Write-Warn "Found an unfinished adopt in ${T}: starting it again."
+                Remove-Item -LiteralPath (Join-Path $T '.git') -Recurse -Force -ErrorAction SilentlyContinue
+                Invoke-Adopt
+                return
+            }
             Update-Existing
             return
         }
@@ -320,13 +327,13 @@ function Invoke-Adopt {
     Test-Remote $script:FetchUrl -Fatal | Out-Null
     Write-Warn "Adopting the existing ${T}: close running Claude Code sessions first, since they can hold files open."
     if (-not (Invoke-Git @('-C', $T, 'init', '-q', '-b', 'master'))) { Stop-Adopt "git init failed in $T." }
-    Invoke-Git @('-C', $T, 'config', 'core.autocrlf', 'false') | Out-Null
+    if (-not (Invoke-Git @('-C', $T, 'config', 'core.autocrlf', 'false'))) { Stop-Adopt "git config failed in $T." }
     if (-not (Invoke-Git @('-C', $T, 'remote', 'add', 'origin', $script:FetchUrl))) { Stop-Adopt 'git remote add failed.' }
     if (-not (Invoke-Git @('-C', $T, 'fetch', '-q', 'origin'))) { Stop-Adopt "git fetch from $($script:FetchUrl) failed." }
     if (-not (Invoke-Git @('-C', $T, 'reset', '-q', 'origin/master'))) { Stop-Adopt 'git reset to origin/master failed.' }
     if (-not (Invoke-Git @('-C', $T, 'branch', '-q', '-u', 'origin/master'))) { Stop-Adopt 'git branch -u origin/master failed.' }
     if ($script:FetchUrl -ne $script:OriginUrl) {
-        Invoke-Git @('-C', $T, 'remote', 'set-url', 'origin', $script:OriginUrl) | Out-Null
+        if (-not (Invoke-Git @('-C', $T, 'remote', 'set-url', 'origin', $script:OriginUrl))) { Stop-Adopt 'git remote set-url failed.' }
     }
     Backup-Conflicts
     if (-not (Invoke-Git @('-C', $T, 'checkout', '--', '.'))) {
