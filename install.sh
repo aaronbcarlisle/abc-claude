@@ -448,6 +448,121 @@ check_python() {
     fi
 }
 
+# --- plugin sync ------------------------------------------------------------
+# manifest: "P<TAB>id" per enabledPlugins key, "M<TAB>name<TAB>source" per
+# extraKnownMarketplaces entry. ids/names: one per line from CLI JSON on stdin.
+PLUGINS_PY='
+import json, sys
+mode = sys.argv[1]
+if mode == "manifest":
+    with open(sys.argv[2], encoding="utf-8-sig") as f:
+        settings = json.load(f)
+    lines = ["P\t" + pid for pid in (settings.get("enabledPlugins") or {})]
+    for name, entry in (settings.get("extraKnownMarketplaces") or {}).items():
+        src = (entry or {}).get("source") or {}
+        arg = {"github": src.get("repo"), "git": src.get("url"), "url": src.get("url"),
+               "directory": src.get("path"), "file": src.get("path")}.get(src.get("source")) or ""
+        lines.append("M\t" + name + "\t" + arg)
+else:
+    key = "id" if mode == "ids" else "name"
+    lines = [str(item[key]) for item in json.load(sys.stdin.buffer) if isinstance(item, dict) and item.get(key)]
+sys.stdout.buffer.write("".join(line + "\n" for line in lines).encode("utf-8"))
+'
+
+plugin_sync() {
+    if ! have claude; then
+        warn "claude is not on PATH - skipping plugin sync."
+        return 0
+    fi
+    settings="$TARGET/settings.json"
+    if [ ! -f "$settings" ]; then
+        warn "settings.json is missing - skipping plugin sync."
+        return 0
+    fi
+    manifest=$("$PY" -c "$PLUGINS_PY" manifest "$settings") || {
+        warn "Could not read the plugin manifest from settings.json - skipping plugin sync."
+        return 0
+    }
+    installed=$(claude plugin list --json </dev/null | "$PY" -c "$PLUGINS_PY" ids) || {
+        warn "Could not list installed plugins (claude plugin list --json) - skipping plugin sync."
+        return 0
+    }
+    known=$(claude plugin marketplace list --json </dev/null | "$PY" -c "$PLUGINS_PY" names) || {
+        warn "Could not list marketplaces (claude plugin marketplace list --json) - skipping plugin sync."
+        return 0
+    }
+    snapshot=$(mktemp)
+    cp "$settings" "$snapshot"
+    present=""
+    added=""
+    failed=""
+    set -f; old_ifs=$IFS; IFS=$NL
+    for line in $manifest; do
+        kind=${line%%"$TAB"*}
+        if [ "$kind" != M ]; then continue; fi
+        rest=${line#*"$TAB"}
+        name=${rest%%"$TAB"*}
+        source=${rest#*"$TAB"}
+        if printf '%s\n' "$known" | grep -Fqx -- "$name" || [ "$name" = claude-plugins-official ]; then
+            present="$present, marketplace $name"
+        elif [ -z "$source" ]; then
+            warn "Marketplace $name has a source type the installer can't add: add it with claude plugin marketplace add."
+            failed="$failed, marketplace $name"
+        elif claude plugin marketplace add "$source" </dev/null; then
+            added="$added, marketplace $name"
+        else
+            warn "Could not add marketplace $name ($source)."
+            failed="$failed, marketplace $name"
+        fi
+    done
+    for line in $manifest; do
+        kind=${line%%"$TAB"*}
+        if [ "$kind" != P ]; then continue; fi
+        pid=${line#*"$TAB"}
+        if printf '%s\n' "$installed" | grep -Fqx -- "$pid"; then
+            present="$present, $pid"
+        elif claude plugin install "$pid" </dev/null; then
+            added="$added, $pid"
+        else
+            warn "Could not install $pid."
+            failed="$failed, $pid"
+        fi
+    done
+    extras=""
+    for pid in $installed; do
+        if ! printf '%s\n' "$manifest" | grep -Fqx -- "P$TAB$pid"; then extras="$extras$pid$NL"; fi
+    done
+    IFS=$old_ifs; set +f
+    if ! cmp -s "$snapshot" "$settings"; then
+        cp "$snapshot" "$settings"
+        info "Restored settings.json after the claude CLI changed it: the tracked file is the plugin manifest."
+    fi
+    rm -f "$snapshot"
+    if [ -n "$present" ]; then info "Already present: ${present#, }"; fi
+    if [ -n "$added" ]; then info "Installed: ${added#, }"; fi
+    if [ -n "$failed" ]; then warn "Failed: ${failed#, }"; fi
+    if [ -z "$extras" ]; then return 0; fi
+    set -f; IFS=$NL
+    for pid in $extras; do
+        if [ "$PRUNE" = 1 ] && [ "$YES" = 0 ]; then
+            answer=$(ask "Uninstall $pid (installed but not in settings.json)? (y/n)" "n")
+            case "$answer" in
+                [Yy]*)
+                    if claude plugin uninstall "$pid" </dev/null; then info "Uninstalled $pid."; else warn "Could not uninstall $pid."; fi ;;
+                *) info "Kept $pid." ;;
+            esac
+        else
+            info "Installed but not in settings.json: $pid"
+        fi
+    done
+    IFS=$old_ifs; set +f
+    if [ "$PRUNE" = 1 ] && [ "$YES" = 1 ]; then
+        info "Non-interactive run: prune only reports."
+    elif [ "$PRUNE" = 0 ]; then
+        info "Re-run with --prune (-Prune) to choose which of these to uninstall."
+    fi
+}
+
 # --- summary ----------------------------------------------------------------
 summary() {
     if [ -n "$BACKUPS" ]; then
@@ -473,4 +588,5 @@ setup_local_md
 setup_identity
 report_managed
 check_python
+plugin_sync
 summary

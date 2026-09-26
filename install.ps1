@@ -437,6 +437,102 @@ function Test-PythonFromBash {
     }
 }
 
+# --- plugin sync ------------------------------------------------------------
+# Parsed JSON from a `claude ... --json` command, or $null when it fails.
+function Get-ClaudeJson([string[]]$ArgList) {
+    $raw = @(Invoke-Quiet 'claude' $ArgList)
+    if ($script:NativeExit -ne 0) { return $null }
+    # Assign before wrapping: in 5.1 ConvertFrom-Json emits a JSON array as one
+    # object, so @(... | ConvertFrom-Json) would nest it.
+    try { $parsed = ($raw -join "`n") | ConvertFrom-Json } catch { return $null }
+    return ,@($parsed)
+}
+
+function Invoke-PluginSync {
+    if (-not (Have 'claude')) { Write-Warn 'claude is not on PATH - skipping plugin sync.'; return }
+    $settingsPath = Join-Path $script:Target 'settings.json'
+    if (-not (Test-Path -LiteralPath $settingsPath)) { Write-Warn 'settings.json is missing - skipping plugin sync.'; return }
+    try {
+        $settings = Get-Content -LiteralPath $settingsPath -Raw -Encoding UTF8 | ConvertFrom-Json
+    } catch {
+        Write-Warn 'Could not read the plugin manifest from settings.json - skipping plugin sync.'
+        return
+    }
+    $wanted = @()
+    if ($settings.enabledPlugins) { $wanted = @($settings.enabledPlugins.PSObject.Properties | ForEach-Object { $_.Name }) }
+    $markets = @()
+    if ($settings.extraKnownMarketplaces) {
+        foreach ($p in $settings.extraKnownMarketplaces.PSObject.Properties) {
+            $src = $p.Value.source
+            $arg = ''
+            if ($src) {
+                switch ([string]$src.source) {
+                    'github' { $arg = [string]$src.repo }
+                    'git' { $arg = [string]$src.url }
+                    'url' { $arg = [string]$src.url }
+                    'directory' { $arg = [string]$src.path }
+                    'file' { $arg = [string]$src.path }
+                }
+            }
+            $markets += [pscustomobject]@{ Name = $p.Name; Source = $arg }
+        }
+    }
+    $pluginJson = Get-ClaudeJson @('plugin', 'list', '--json')
+    if ($null -eq $pluginJson) { Write-Warn 'Could not list installed plugins (claude plugin list --json) - skipping plugin sync.'; return }
+    $installed = @(foreach ($i in $pluginJson) { if ($i.id) { [string]$i.id } })
+    $marketJson = Get-ClaudeJson @('plugin', 'marketplace', 'list', '--json')
+    if ($null -eq $marketJson) { Write-Warn 'Could not list marketplaces (claude plugin marketplace list --json) - skipping plugin sync.'; return }
+    $known = @(foreach ($i in $marketJson) { if ($i.name) { [string]$i.name } })
+
+    $before = [System.IO.File]::ReadAllBytes($settingsPath)
+    $present = @()
+    $added = @()
+    $failed = @()
+    foreach ($m in $markets) {
+        if (($known -contains $m.Name) -or $m.Name -eq 'claude-plugins-official') {
+            $present += "marketplace $($m.Name)"
+        } elseif (-not $m.Source) {
+            Write-Warn "Marketplace $($m.Name) has a source type the installer can't add: add it with claude plugin marketplace add."
+            $failed += "marketplace $($m.Name)"
+        } else {
+            & claude plugin marketplace add $m.Source | Out-Host
+            if ($LASTEXITCODE -eq 0) { $added += "marketplace $($m.Name)" }
+            else { Write-Warn "Could not add marketplace $($m.Name) ($($m.Source))."; $failed += "marketplace $($m.Name)" }
+        }
+    }
+    foreach ($id in $wanted) {
+        if ($installed -contains $id) { $present += $id; continue }
+        & claude plugin install $id | Out-Host
+        if ($LASTEXITCODE -eq 0) { $added += $id } else { Write-Warn "Could not install $id."; $failed += $id }
+    }
+    $after = [System.IO.File]::ReadAllBytes($settingsPath)
+    if ([Convert]::ToBase64String($before) -ne [Convert]::ToBase64String($after)) {
+        [System.IO.File]::WriteAllBytes($settingsPath, $before)
+        Write-Info 'Restored settings.json after the claude CLI changed it: the tracked file is the plugin manifest.'
+    }
+    if ($present.Count -gt 0) { Write-Info "Already present: $($present -join ', ')" }
+    if ($added.Count -gt 0) { Write-Info "Installed: $($added -join ', ')" }
+    if ($failed.Count -gt 0) { Write-Warn "Failed: $($failed -join ', ')" }
+
+    $extras = @($installed | Where-Object { $wanted -notcontains $_ })
+    if ($extras.Count -eq 0) { return }
+    foreach ($id in $extras) {
+        if ($Prune -and -not $Yes) {
+            $answer = Ask "Uninstall $id (installed but not in settings.json)? (y/n)" 'n'
+            if ($answer -match '^[Yy]') {
+                & claude plugin uninstall $id | Out-Host
+                if ($LASTEXITCODE -eq 0) { Write-Info "Uninstalled $id." } else { Write-Warn "Could not uninstall $id." }
+            } else {
+                Write-Info "Kept $id."
+            }
+        } else {
+            Write-Info "Installed but not in settings.json: $id"
+        }
+    }
+    if ($Prune -and $Yes) { Write-Info 'Non-interactive run: prune only reports.' }
+    elseif (-not $Prune) { Write-Info 'Re-run with --prune (-Prune) to choose which of these to uninstall.' }
+}
+
 # --- summary ----------------------------------------------------------------
 function Write-Summary {
     if ($script:Backups.Count -gt 0) {
@@ -462,5 +558,6 @@ Initialize-LocalMd
 Set-RepoIdentity
 Write-ManagedReport
 Test-PythonFromBash
+Invoke-PluginSync
 Write-Summary
 exit 0

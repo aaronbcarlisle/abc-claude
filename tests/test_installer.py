@@ -315,6 +315,87 @@ class InstallerScenarios:
         self.assertOk(result)
         self.assertIn("Could not parse " + str(managed) + " as JSON.", result.output)
 
+    # --- task 9: plugin sync ------------------------------------------------
+    def test_plugin_sync_installs_only_missing(self):
+        self.sb.fake_claude(plugins=["alpha@claude-plugins-official"])
+        result = self.install("--yes")
+        self.assertOk(result)
+        calls = self.sb.claude_calls()
+        self.assertIn("plugin list --json", calls)
+        self.assertIn("plugin marketplace list --json", calls)
+        self.assertIn("plugin marketplace add example/extra-market", calls)
+        self.assertIn("plugin install beta@extra-market", calls)
+        self.assertNotIn("plugin install alpha@claude-plugins-official", calls)
+        self.assertIn("Installed: marketplace extra-market, beta@extra-market", result.output)
+        self.assertIn("Already present: alpha@claude-plugins-official", result.output)
+        # The fake CLI rewrote settings.json on install; the installer restores the tracked copy.
+        self.assertIn("Restored settings.json", result.output)
+        self.assertEqual(self.target_git("status", "--porcelain"), "")
+
+    def test_plugin_sync_second_run_installs_nothing(self):
+        self.sb.fake_claude(plugins=["alpha@claude-plugins-official"])
+        self.assertOk(self.install("--yes"))
+        first = len(self.sb.claude_calls())
+        result = self.install("--yes")
+        self.assertOk(result)
+        second = self.sb.claude_calls()[first:]
+        self.assertEqual([c for c in second if not c.endswith("--json")], [], second)
+        self.assertIn("Already present: marketplace extra-market, alpha@claude-plugins-official, beta@extra-market",
+                      result.output)
+
+    def test_plugin_install_failure_is_a_warning(self):
+        self.sb.fake_claude(plugins=["alpha@claude-plugins-official"], fail=["beta@extra-market"])
+        result = self.install("--yes")
+        self.assertOk(result)
+        self.assertIn("Could not install beta@extra-market.", result.output)
+        self.assertIn("Failed: beta@extra-market", result.output)
+
+    def test_marketplace_add_failure_is_a_warning(self):
+        self.sb.fake_claude(plugins=["alpha@claude-plugins-official"], fail=["example/extra-market"])
+        result = self.install("--yes")
+        self.assertOk(result)
+        self.assertIn("Could not add marketplace extra-market (example/extra-market).", result.output)
+        self.assertIn("Failed: marketplace extra-market", result.output)
+
+    def test_unsupported_marketplace_source_type_is_a_warning(self):
+        self.sb.fake_claude(plugins=["alpha@claude-plugins-official"])
+        self.assertOk(self.install("--yes"))
+        settings_path = self.sb.target / "settings.json"
+        settings = json.loads(settings_path.read_text(encoding="utf-8"))
+        settings["extraKnownMarketplaces"]["odd-market"] = {"source": {"source": "npm", "package": "example-market"}}
+        settings_path.write_text(json.dumps(settings, indent=2) + "\n", encoding="utf-8")
+        result = self.install("--yes")
+        self.assertOk(result)
+        self.assertIn(
+            "Marketplace odd-market has a source type the installer can't add: add it with claude plugin marketplace add.",
+            result.output)
+        self.assertIn("marketplace odd-market", result.output)
+        self.assertIn("Failed:", result.output)
+
+    def test_prune_only_reports_under_yes(self):
+        self.sb.fake_claude(plugins=["alpha@claude-plugins-official", "beta@extra-market",
+                                     "gamma@claude-plugins-official"], marketplaces=["claude-plugins-official", "extra-market"])
+        result = self.install("--yes", "--prune")
+        self.assertOk(result)
+        self.assertIn("Installed but not in settings.json: gamma@claude-plugins-official", result.output)
+        self.assertIn("Non-interactive run: prune only reports.", result.output)
+        self.assertFalse(any(c.startswith("plugin uninstall") for c in self.sb.claude_calls()))
+
+    def test_prune_interactive_uninstalls_after_yes(self):
+        self.sb.fake_claude(plugins=["alpha@claude-plugins-official", "beta@extra-market",
+                                     "gamma@claude-plugins-official"], marketplaces=["claude-plugins-official", "extra-market"])
+        self.assertOk(self.install("--yes"))
+        result = self.install("--prune", stdin="y\n")
+        self.assertOk(result)
+        self.assertIn("plugin uninstall gamma@claude-plugins-official", self.sb.claude_calls())
+        self.assertIn("Uninstalled gamma@claude-plugins-official.", result.output)
+        self.assertNotIn("gamma@claude-plugins-official", self.sb.claude_plugins())
+
+    def test_claude_missing_skips_plugin_sync(self):
+        result = self.install("--yes")
+        self.assertOk(result)
+        self.assertIn("claude is not on PATH - skipping plugin sync.", result.output)
+
 
 class ShTests(InstallerScenarios, unittest.TestCase):
     INTERP = "sh"
