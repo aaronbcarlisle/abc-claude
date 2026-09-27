@@ -125,6 +125,9 @@ class PushGuardTest(unittest.TestCase):
                            tool="PowerShell")
         # PowerShell parentheses aren't subshells: the location change sticks.
         self.assertAllowed('(Set-Location "%s"); git push' % self.feature_repo, self.main_repo, tool="PowerShell")
+        # A PowerShell variable holding the branch or the directory is followed.
+        self.assertBlocked("$b = 'main'; git push origin $b", self.feature_repo, tool="PowerShell")
+        self.assertBlocked('$d = "%s"; Set-Location $d; git push' % self.main_repo, self.other, tool="PowerShell")
 
     def test_default_branch_comes_from_the_remote(self):
         self.assertBlocked("git push origin master", self.master_repo)
@@ -201,6 +204,147 @@ class HeredocGuardTest(unittest.TestCase):
                     "$b = @'\nbody\n'@\ngh pr create --body $b 2>$null",
                     "$b = @'\nDon't git push origin main\n'@\ngh pr comment 1 --body $b"):
             self.assertEqual(run_hook(cmd, self.cwd, tool="PowerShell"), (0, ""), cmd)
+
+
+class AttributionGuardTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.cwd = self.tmp.name
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def write(self, name, text):
+        path = os.path.join(self.cwd, name)
+        with open(path, "w", encoding="utf-8", newline="") as f:
+            f.write(text)
+        return path
+
+    def assertBlocked(self, command, cwd=None, tool="Bash"):
+        code, err = run_hook(command, cwd or self.cwd, tool)
+        self.assertEqual(code, 2, command)
+        self.assertIn("ATTRIBUTION BLOCKED", err, command)
+
+    def assertAllowed(self, command, cwd=None, tool="Bash"):
+        code, err = run_hook(command, cwd or self.cwd, tool)
+        self.assertEqual((code, err), (0, ""), command)
+
+    def test_dash_m_trailer_blocks(self):
+        self.assertBlocked('git commit -m "x\n\nCo-Authored-By: Claude <noreply@anthropic.com>"')
+
+    def test_dash_m_clean_message_passes(self):
+        self.assertAllowed('git commit -m "fix the thing"')
+
+    def test_dash_capital_f_file_with_trailer_blocks(self):
+        self.write("msg.txt", "Fix bug\n\nCo-Authored-By: Claude <noreply@anthropic.com>\n")
+        self.assertBlocked("git commit -F msg.txt")
+
+    def test_dash_capital_f_clean_file_passes(self):
+        self.write("msg.txt", "Fix bug\n\nCo-authored-by: Jane Doe <jane@example.com>\n")
+        self.assertAllowed("git commit -F msg.txt")
+
+    def test_trailer_flag_blocks(self):
+        self.assertBlocked('git commit -m "subject" --trailer "Co-authored-by: Claude <noreply@anthropic.com>"')
+
+    def test_trailer_flag_key_equals_value_form_blocks(self):
+        self.assertBlocked('git commit -m "subject" --trailer "Co-authored-by=Claude <noreply@anthropic.com>"')
+
+    def test_short_option_clusters_carry_the_message(self):
+        trailer = "Co-Authored-By: Claude <noreply@anthropic.com>"
+        self.assertBlocked(f'git commit -am "x\n\n{trailer}"')
+        self.assertBlocked(f'git commit -sam"x\n\n{trailer}"')
+        self.write("msg.txt", f"Fix bug\n\n{trailer}\n")
+        self.assertBlocked("git commit -aF msg.txt")
+        self.assertAllowed('git commit -am "fix the thing"')
+
+    def test_gh_pr_create_body_file_generated_with_blocks(self):
+        self.write("body.md", "Adds the thing.\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n")
+        self.assertBlocked('gh pr create --title "t" --body-file body.md')
+
+    def test_gh_pr_edit_body_session_link_blocks(self):
+        self.assertBlocked('gh pr edit 1 --body "See notes. https://claude.ai/code/session_01AbC more text"')
+
+    def test_gh_api_field_value_blocks(self):
+        self.assertBlocked(
+            'gh api -X PATCH repos/o/r/pulls/1 -f "body=Fix the thing.\n\nCo-Authored-By: Claude <noreply@anthropic.com>"')
+
+    def test_gh_pr_merge_body_trailer_blocks(self):
+        self.assertBlocked('gh pr merge 1 --squash --body "Merge it.\n\nCo-Authored-By: Claude <noreply@anthropic.com>"')
+
+    def test_gh_repo_flag_before_or_between_command_words_blocks(self):
+        body = '--body "x\n\nCo-Authored-By: Claude <noreply@anthropic.com>"'
+        for words in ("--repo o/r pr create", "-R o/r pr create", "--repo=o/r pr create",
+                      "pr --repo o/r create", "pr -R o/r comment 1", "-R o/r issue create"):
+            self.assertBlocked(f"gh {words} --title t {body}")
+        self.assertBlocked('gh -R o/r api repos/o/r/issues/1/comments'
+                           ' -f "body=x\n\nCo-Authored-By: Claude <noreply@anthropic.com>"')
+        self.assertAllowed('gh --repo o/r pr create --title t --body "fix the thing"')
+
+    def test_gh_new_alias_blocks(self):
+        self.assertBlocked('gh pr new --title t --body "x\n\nCo-Authored-By: Claude <noreply@anthropic.com>"')
+        self.assertBlocked('gh issue new --title t --body "x\n\nCo-Authored-By: Claude <noreply@anthropic.com>"')
+        self.assertBlocked('gh release new v1 --notes "x\n\nCo-Authored-By: Claude <noreply@anthropic.com>"')
+
+    def test_powershell_commit_trailer_blocks(self):
+        self.assertBlocked('git commit -m "x\n\nCo-Authored-By: Claude <noreply@anthropic.com>"', tool="PowerShell")
+
+    def test_heredoc_text_blocks(self):
+        trailer = "Co-Authored-By: Claude <noreply@anthropic.com>"
+        # Claude Code's own default commit and PR forms.
+        self.assertBlocked(f"git commit -m \"$(cat <<'EOF'\nFix it\n\n{trailer}\nEOF\n)\"")
+        self.assertBlocked(f"gh pr create --title t --body \"$(cat <<'EOF'\nAdds it.\n\n{trailer}\nEOF\n)\"")
+        # stdin from a heredoc or a here-string
+        self.assertBlocked(f"git commit -F - <<'EOF'\nFix it\n\n{trailer}\nEOF")
+        self.assertBlocked(f"gh api repos/o/r/issues/1/comments --input - <<'EOF'\n{{\"body\": \"x\\n\\n{trailer}\"}}\nEOF")
+        self.assertBlocked(f'git commit -F - <<< "x\n\n{trailer}"')
+        self.assertAllowed("git commit -m \"$(cat <<'EOF'\nFix it\nEOF\n)\"")
+        self.assertAllowed("git commit -F - <<'EOF'\nFix it\nEOF")
+
+    def test_shell_variable_holding_the_text_blocks(self):
+        trailer = "Co-Authored-By: Claude <noreply@anthropic.com>"
+        self.assertBlocked(f"BODY=\"$(cat <<'EOF'\nAdds it.\n\n{trailer}\nEOF\n)\"\ngh pr create --title t --body \"$BODY\"")
+        self.assertBlocked(f'msg="x\n\n{trailer}"; git commit -m "${{msg}}"')
+        self.assertAllowed(f'msg="x\n\n{trailer}"; git commit -m "$other"')
+
+    def test_powershell_backtick_newlines_block(self):
+        self.assertBlocked('git commit -m "x`n`nCo-Authored-By: Claude <noreply@anthropic.com>"', tool="PowerShell")
+
+    def test_powershell_herestring_text_blocks(self):
+        trailer = "Co-Authored-By: Claude <noreply@anthropic.com>"
+        # A quote inside the here-string must not end it early.
+        self.assertBlocked(f"git commit -m @'\nFix the parser's bug\n\n{trailer}\n'@", tool="PowerShell")
+        self.assertBlocked(f'git commit -m @"\nFix the "quoted" bug\n\n{trailer}\n"@', tool="PowerShell")
+        self.assertBlocked(f"gh pr create --title t --body @'\r\nAdds it.\r\n\r\n{trailer}\r\n'@", tool="PowerShell")
+        self.assertAllowed("git commit -m @'\nFix the parser's bug\n'@", tool="PowerShell")
+
+    def test_powershell_variable_holding_the_text_blocks(self):
+        trailer = "Co-Authored-By: Claude <noreply@anthropic.com>"
+        self.assertBlocked(f"$body = @'\nAdds it.\n\n{trailer}\n'@\ngh pr create --title t --body $body",
+                           tool="PowerShell")
+        self.assertBlocked(f"$Msg = \"x`n`n{trailer}\"; git commit -m $msg", tool="PowerShell")
+        self.assertAllowed("$body = @'\nAdds it.\n'@\ngh pr create --title t --body $body", tool="PowerShell")
+
+    def test_echoed_command_text_passes(self):
+        self.assertAllowed("""echo "git commit -m 'Co-Authored-By: Claude'\"""")
+
+    def test_prose_mentions_pass(self):
+        self.assertAllowed('git commit -m "Not ported: the Claude review workflow"')
+        self.assertAllowed('git commit -m "Cleanup: drop the Co-Authored-By trailers that name Claude"')
+
+    def test_dash_capital_f_dash_stdin_passes(self):
+        self.assertAllowed("git commit -F -")
+
+    def test_missing_dash_capital_f_file_passes(self):
+        self.assertAllowed("git commit -F does-not-exist.txt")
+
+    def test_dash_capital_c_resolves_file_relative_to_target(self):
+        target = os.path.join(self.tmp.name, "repo")
+        os.makedirs(os.path.join(target, "rel"))
+        with open(os.path.join(target, "rel", "path"), "w", encoding="utf-8", newline="") as f:
+            f.write("Fix bug\n\nCo-Authored-By: Claude <noreply@anthropic.com>\n")
+        other = os.path.join(self.tmp.name, "elsewhere")
+        os.makedirs(other)
+        self.assertBlocked('git -C "%s" commit -F rel/path' % target, cwd=other)
 
 
 class FailOpenTest(unittest.TestCase):

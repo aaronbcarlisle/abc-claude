@@ -7,6 +7,11 @@
     "defaultMode": "auto"
   },
   "model": "opus",
+  "attribution": {
+    "commit": "",
+    "pr": "",
+    "sessionUrl": false
+  },
   "skillOverrides": {
     "anthropic-skills:docx": "off",
     "anthropic-skills:pptx": "off",
