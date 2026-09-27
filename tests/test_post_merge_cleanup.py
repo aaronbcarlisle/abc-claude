@@ -590,6 +590,17 @@ class FinishTest(CleanupCase):
         self.assertEqual(after, git(self.work, self.env, "rev-parse", "origin/main"))
         self.assertTrue(after.startswith(r["sha"]))
 
+    def test_pull_fast_forwards_without_a_local_upstream(self):
+        self.merged()
+        git(self.work, self.env, "branch", "--unset-upstream", "main")
+        before = git(self.work, self.env, "rev-parse", "HEAD")
+        code, r = self.cleanup()
+        self.assertEqual(code, 0, r)
+        self.assertTrue(r["pulled"])
+        after = git(self.work, self.env, "rev-parse", "HEAD")
+        self.assertNotEqual(after, before)
+        self.assertEqual(after, git(self.work, self.env, "rev-parse", "origin/main"))
+
     def test_dirty_main_checkout_with_here_notes_the_skipped_pull(self):
         self.merged()
         with open(os.path.join(self.work, "README.md"), "a", encoding="utf-8") as f:

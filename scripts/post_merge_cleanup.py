@@ -392,7 +392,7 @@ def finish(repo, default, args, report, top, main_live):
         elif dirty(repo):
             notes.append("main checkout has uncommitted changes: pull skipped")
         else:
-            pulled = run(["git", "pull", "--ff-only", "--quiet"], repo, check=False)
+            pulled = run(["git", "pull", "--ff-only", "--quiet", "origin", default], repo, check=False)
             report["pulled"] = up_to_date = pulled.returncode == 0
             if pulled.returncode != 0:
                 notes.append("pull failed: " + pulled.stderr.strip())
