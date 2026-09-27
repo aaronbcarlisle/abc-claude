@@ -2022,13 +2022,35 @@ class SkillFilesTest(unittest.TestCase):
             for name in re.findall(r"\.claude/scripts/([\w.-]+\.py)", body(os.path.join(REPO, rel))):
                 self.assertTrue(os.path.isfile(os.path.join(REPO, "scripts", name)), "%s: %s" % (rel, name))
 
+    def test_tools_a_skill_names_are_in_its_allowed_tools(self):
+        # allowed-tools pre-approves tools for the turn that invokes the skill. A tool the text tells
+        # the model to use belongs in the list too, so an unattended run isn't held up by a prompt.
+        named = ("AskUserQuestion", "Agent", "Monitor", "TaskStop", "TodoWrite")
+        for rel in tracked("skills/*/SKILL.md"):
+            path = os.path.join(REPO, rel)
+            allowed = frontmatter(path).get("allowed-tools")
+            if not isinstance(allowed, list) or not allowed:
+                continue
+            text = body(path).split("\n---\n", 1)[1]  # the text after the frontmatter
+            for tool in named:
+                if re.search(r"\b%s\b" % tool, text):
+                    self.assertIn(tool, allowed, "%s uses %s" % (rel, tool))
+            if re.search(r"invoke the `[\w:-]+` skill|run `/[\w-]+", text):
+                self.assertIn("Skill", allowed, "%s invokes a skill" % rel)
+
 
 class ShipLoopTest(unittest.TestCase):
     def test_pr_review_loop_is_model_invocable_with_ship(self):
         data = frontmatter(skill("pr-review-loop"))
         self.assertEqual(data.get("disable-model-invocation"), "false")
         self.assertIn("ship", data.get("argument-hint", ""))
-        self.assertIn("Bash(python:*)", data.get("allowed-tools", []))
+        for tool in ("Bash(python:*)", "AskUserQuestion", "TodoWrite", "TaskCreate", "TaskUpdate", "TaskList"):
+            self.assertIn(tool, data.get("allowed-tools", []), tool)
+
+    def test_ship_allows_the_tools_it_uses(self):
+        allowed = frontmatter(skill("ship")).get("allowed-tools", [])
+        for tool in ("Skill", "AskUserQuestion", "Write"):
+            self.assertIn(tool, allowed, tool)
 
     def test_pr_review_loop_merges_only_through_phase_6(self):
         text = body(skill("pr-review-loop"))
@@ -2099,7 +2121,7 @@ if __name__ == "__main__":
 ```
 
 - [ ] **Step 2: Run them to watch them fail.** Run `python -m unittest tests.test_skill_files -v`. Expected:
-  - `SkillFilesTest` passes, since it covers the current skills;
+  - `SkillFilesTest` passes, since it covers the current skills, except `test_tools_a_skill_names_are_in_its_allowed_tools`: pr-review-loop's text names TodoWrite, which its `allowed-tools` lacks until Step 4 (a);
   - every `ShipLoopTest` test fails, with missing `ship`, `disable-model-invocation: true` or a missing `skills/ship/SKILL.md`.
 
 - [ ] **Step 3: Create** `skills/ship/SKILL.md`:
@@ -2119,6 +2141,8 @@ allowed-tools:
   - Bash(mkdir:*)
   - Bash(touch:*)
   - Bash(rm:*)
+  - Skill
+  - AskUserQuestion
   - Read
   - Write
   - Edit
@@ -2138,7 +2162,7 @@ allowed-tools:
 
 ## 1. Check
 - Stop if the branch is the default branch, or `git rev-list --count origin/<default>..HEAD` is 0.
-- If the tree has uncommitted changes, ask whether they belong in this PR before going on.
+- If the tree has uncommitted changes, ask (AskUserQuestion) whether they belong in this PR before going on.
 - If the PR for this branch is OPEN and not a draft, skip to step 6 with its number. If it's a draft, say so and stop: drafts opt out of auto-merge.
 
 ## 2. Gates
@@ -2192,7 +2216,15 @@ argument-hint: "[ship] [max-iterations] [#PR ...] [extra instructions]"
 disable-model-invocation: false
 ```
 
-Add `  - Bash(python:*)` to `allowed-tools` after `  - Bash(bash:*)`.
+In `allowed-tools`, add `  - Bash(python:*)` after `  - Bash(bash:*)`. After `  - TaskStop`, add the tools the skill's text already tells the model to use: the task list ("TodoWrite or the Task tools") and asking the owner:
+
+```
+  - TodoWrite
+  - TaskCreate
+  - TaskUpdate
+  - TaskList
+  - AskUserQuestion
+```
 
 (b) "Interpret the arguments". Replace `- A leading integer is max iterations (default 25).` with:
 
@@ -2348,6 +2380,12 @@ class FinalizeStackTest(unittest.TestCase):
     def test_owner_invoked_only(self):
         self.assertEqual(frontmatter(skill("finalize-stack")).get("disable-model-invocation"), "true")
 
+    def test_allows_the_tools_it_uses(self):
+        # AskUserQuestion: picking a chain and batching owner rulings; Skill: `/handoff log`.
+        allowed = frontmatter(skill("finalize-stack")).get("allowed-tools", [])
+        for tool in ("AskUserQuestion", "Agent", "Skill", "Monitor"):
+            self.assertIn(tool, allowed, tool)
+
     def test_force_pushes_only_with_lease_and_merges_bottom_up(self):
         text = body(skill("finalize-stack"))
         self.assertIn("--force-with-lease", text)
@@ -2385,6 +2423,8 @@ allowed-tools:
   - Monitor
   - TaskStop
   - Agent
+  - AskUserQuestion
+  - Skill
   - Read
   - Edit
   - Write
