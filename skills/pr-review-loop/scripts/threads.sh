@@ -15,13 +15,16 @@ query($owner:String!,$repo:String!,$pr:Int!,$endCursor:String){
     reviewThreads(first:100,after:$endCursor){ pageInfo{hasNextPage endCursor}
       nodes{ id isResolved isOutdated path line
         opener:comments(first:1){nodes{databaseId author{login} body}}
-        latest:comments(last:1){nodes{author{login} body createdAt originalCommit{abbreviatedOid}}}
-}}}}}' --jq ".data.repository.pullRequest.reviewThreads.nodes[] | $filter | {
+        latest:comments(last:1){nodes{databaseId author{login} body createdAt originalCommit{abbreviatedOid}}}
+}}}}}' --jq ".data.repository.pullRequest.reviewThreads.nodes[] | $filter |
+  (.opener.nodes[0].body // \"\") as \$ask | (.latest.nodes[0].body // \"\") as \$last | {
   thread: .id, resolved: .isResolved, outdated: .isOutdated, path, line,
   reply_to: .opener.nodes[0].databaseId,
+  last_id: .latest.nodes[0].databaseId,
   opened_by: .opener.nodes[0].author.login,
   last_by: .latest.nodes[0].author.login,
   on_commit: .latest.nodes[0].originalCommit.abbreviatedOid,
-  ask: (.opener.nodes[0].body // \"\")[0:400],
-  last: (.latest.nodes[0].body // \"\")[0:300]
+  ask: \$ask[0:400],
+  last: \$last[0:300],
+  truncated: ((\$ask | length) > 400 or (\$last | length) > 300)
 }"
