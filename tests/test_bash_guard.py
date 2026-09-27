@@ -125,6 +125,9 @@ class PushGuardTest(unittest.TestCase):
                            tool="PowerShell")
         # PowerShell parentheses aren't subshells: the location change sticks.
         self.assertAllowed('(Set-Location "%s"); git push' % self.feature_repo, self.main_repo, tool="PowerShell")
+        # A PowerShell variable holding the branch or the directory is followed.
+        self.assertBlocked("$b = 'main'; git push origin $b", self.feature_repo, tool="PowerShell")
+        self.assertBlocked('$d = "%s"; Set-Location $d; git push' % self.main_repo, self.other, tool="PowerShell")
 
     def test_default_branch_comes_from_the_remote(self):
         self.assertBlocked("git push origin master", self.master_repo)
@@ -268,8 +271,58 @@ class AttributionGuardTest(unittest.TestCase):
     def test_gh_pr_merge_body_trailer_blocks(self):
         self.assertBlocked('gh pr merge 1 --squash --body "Merge it.\n\nCo-Authored-By: Claude <noreply@anthropic.com>"')
 
+    def test_gh_repo_flag_before_or_between_command_words_blocks(self):
+        body = '--body "x\n\nCo-Authored-By: Claude <noreply@anthropic.com>"'
+        for words in ("--repo o/r pr create", "-R o/r pr create", "--repo=o/r pr create",
+                      "pr --repo o/r create", "pr -R o/r comment 1", "-R o/r issue create"):
+            self.assertBlocked(f"gh {words} --title t {body}")
+        self.assertBlocked('gh -R o/r api repos/o/r/issues/1/comments'
+                           ' -f "body=x\n\nCo-Authored-By: Claude <noreply@anthropic.com>"')
+        self.assertAllowed('gh --repo o/r pr create --title t --body "fix the thing"')
+
+    def test_gh_new_alias_blocks(self):
+        self.assertBlocked('gh pr new --title t --body "x\n\nCo-Authored-By: Claude <noreply@anthropic.com>"')
+        self.assertBlocked('gh issue new --title t --body "x\n\nCo-Authored-By: Claude <noreply@anthropic.com>"')
+        self.assertBlocked('gh release new v1 --notes "x\n\nCo-Authored-By: Claude <noreply@anthropic.com>"')
+
     def test_powershell_commit_trailer_blocks(self):
         self.assertBlocked('git commit -m "x\n\nCo-Authored-By: Claude <noreply@anthropic.com>"', tool="PowerShell")
+
+    def test_heredoc_text_blocks(self):
+        trailer = "Co-Authored-By: Claude <noreply@anthropic.com>"
+        # Claude Code's own default commit and PR forms.
+        self.assertBlocked(f"git commit -m \"$(cat <<'EOF'\nFix it\n\n{trailer}\nEOF\n)\"")
+        self.assertBlocked(f"gh pr create --title t --body \"$(cat <<'EOF'\nAdds it.\n\n{trailer}\nEOF\n)\"")
+        # stdin from a heredoc or a here-string
+        self.assertBlocked(f"git commit -F - <<'EOF'\nFix it\n\n{trailer}\nEOF")
+        self.assertBlocked(f"gh api repos/o/r/issues/1/comments --input - <<'EOF'\n{{\"body\": \"x\\n\\n{trailer}\"}}\nEOF")
+        self.assertBlocked(f'git commit -F - <<< "x\n\n{trailer}"')
+        self.assertAllowed("git commit -m \"$(cat <<'EOF'\nFix it\nEOF\n)\"")
+        self.assertAllowed("git commit -F - <<'EOF'\nFix it\nEOF")
+
+    def test_shell_variable_holding_the_text_blocks(self):
+        trailer = "Co-Authored-By: Claude <noreply@anthropic.com>"
+        self.assertBlocked(f"BODY=\"$(cat <<'EOF'\nAdds it.\n\n{trailer}\nEOF\n)\"\ngh pr create --title t --body \"$BODY\"")
+        self.assertBlocked(f'msg="x\n\n{trailer}"; git commit -m "${{msg}}"')
+        self.assertAllowed(f'msg="x\n\n{trailer}"; git commit -m "$other"')
+
+    def test_powershell_backtick_newlines_block(self):
+        self.assertBlocked('git commit -m "x`n`nCo-Authored-By: Claude <noreply@anthropic.com>"', tool="PowerShell")
+
+    def test_powershell_herestring_text_blocks(self):
+        trailer = "Co-Authored-By: Claude <noreply@anthropic.com>"
+        # A quote inside the here-string must not end it early.
+        self.assertBlocked(f"git commit -m @'\nFix the parser's bug\n\n{trailer}\n'@", tool="PowerShell")
+        self.assertBlocked(f'git commit -m @"\nFix the "quoted" bug\n\n{trailer}\n"@', tool="PowerShell")
+        self.assertBlocked(f"gh pr create --title t --body @'\r\nAdds it.\r\n\r\n{trailer}\r\n'@", tool="PowerShell")
+        self.assertAllowed("git commit -m @'\nFix the parser's bug\n'@", tool="PowerShell")
+
+    def test_powershell_variable_holding_the_text_blocks(self):
+        trailer = "Co-Authored-By: Claude <noreply@anthropic.com>"
+        self.assertBlocked(f"$body = @'\nAdds it.\n\n{trailer}\n'@\ngh pr create --title t --body $body",
+                           tool="PowerShell")
+        self.assertBlocked(f"$Msg = \"x`n`n{trailer}\"; git commit -m $msg", tool="PowerShell")
+        self.assertAllowed("$body = @'\nAdds it.\n'@\ngh pr create --title t --body $body", tool="PowerShell")
 
     def test_echoed_command_text_passes(self):
         self.assertAllowed("""echo "git commit -m 'Co-Authored-By: Claude'\"""")

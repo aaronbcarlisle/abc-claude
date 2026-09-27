@@ -19,13 +19,16 @@ Enforces two global rules from CLAUDE.md that prose alone didn't hold:
   3. Never add AI attribution to a commit message or PR/issue text. Blocks a
      `git commit`/`git merge` `-m`/`-F`/`--trailer` (long forms and short
      clusters like `-am` too) and a
-     `gh pr|issue|release create|edit|comment|review|merge` `-b`/`--body`-style
-     option, and a `gh api` `-f`/`-F`/`--field`/`--raw-field`/`--input`, whose
-     text carries a Co-Authored-By trailer naming Claude or Anthropic, a
-     Claude-Session trailer, a "Generated with/by Claude Code" line or a
-     claude.ai/code session link. An `-F`/`--body-file`/`--notes-file` file is
-     read relative to the command's modeled cwd; `-F -` (stdin) and an
-     unreadable file are allowed.
+     `gh pr|issue|release create|new|edit|comment|review|merge` `-b`/`--body`-style
+     option (`-R`/`--repo` anywhere), and a `gh api`
+     `-f`/`-F`/`--field`/`--raw-field`/`--input`, whose text carries a
+     Co-Authored-By trailer naming Claude or Anthropic, a Claude-Session
+     trailer, a "Generated with/by Claude Code" line or a claude.ai/code
+     session link. The text can come from a heredoc (`-m "$(cat <<'EOF' ...)"`,
+     `-F - <<'EOF'`), a PowerShell here-string or `` `n `` string, or a
+     variable set earlier in the command. An `-F`/`--body-file`/`--notes-file`
+     file is read relative to the command's modeled cwd. Piped stdin, `$(cat
+     file)`, `$'...'` and an unreadable file are allowed.
 
 Commands are tokenized (quotes, escapes, comments and heredoc bodies handled;
 PowerShell escapes with a backtick, so its Windows paths keep their
@@ -61,8 +64,12 @@ POPD_COMMANDS = {"popd", "pop-location"}
 # Words that can come before a command without changing it: `if git push ...; then`.
 COMMAND_PREFIXES = {"{", "}", "!", "if", "then", "elif", "else", "do", "while", "until",
                     "time", "command", "exec", "nohup", "env"}
-HEREDOC = re.compile(r"<<-?[ \t]*(['\"]?)\\?([A-Za-z_][\w.-]*)\1([^\n]*)\n.*?\n[ \t]*\2[ \t]*(?=\n|$)", re.S)
-HERESTRING = re.compile(r"@(['\"])[ \t]*\r?\n.*?\r?\n\1@", re.S)
+HEREDOC = re.compile(r"<<-?[ \t]*(['\"]?)\\?([A-Za-z_][\w.-]*)\1([^\n]*)\n(.*?)\n[ \t]*\2[ \t]*(?=\n|$)", re.S)
+HERESTRING = re.compile(r"@(['\"])[ \t]*\r?\n(.*?)\r?\n\1@", re.S)
+# Stands in for a heredoc body or here-string while the command is tokenized.
+TEXT_MARKER = re.compile("\0(\\d+)\0")
+PS_ESCAPES = {"n": "\n", "r": "\r", "t": "\t"}  # in a PowerShell "..." string
+ASSIGNMENT = re.compile(r"^[A-Za-z_]\w*=")
 PS_QUOTED = re.compile(r"'(?:[^']|'')*'|\"(?:[^\"`]|`.)*\"", re.S)
 # A PowerShell file write: the cmdlets, [IO.File]::Write*, or a redirect of the
 # output stream (`>`, `>>`, `1>`, `*>`; not `2>` to `6>`, and not to `$null`).
@@ -114,9 +121,12 @@ GIT_SHORT_WITH_VALUE = {"commit": set("mFCctSu"), "merge": set("mFsXS")}
 GH_BODY_OPTS = {"-b": "value", "--body": "value", "-F": "file", "--body-file": "file"}
 GH_SUBJECT_OPTS = {"-t": "value", "--subject": "value"}
 GH_NOTES_OPTS = {"-n": "value", "--notes": "value", "-F": "file", "--notes-file": "file"}
-GH_PR_ACTIONS = {"create", "edit", "comment", "review", "merge"}
-GH_ISSUE_ACTIONS = {"create", "edit", "comment"}
-GH_RELEASE_ACTIONS = {"create", "edit"}
+# `new` is gh's alias for `create`.
+GH_PR_ACTIONS = {"create", "new", "edit", "comment", "review", "merge"}
+GH_ISSUE_ACTIONS = {"create", "new", "edit", "comment"}
+GH_RELEASE_ACTIONS = {"create", "new", "edit"}
+# gh options that may come before or between the command words, with their value.
+GH_GLOBAL_WITH_ARG = {"-R", "--repo"}
 GH_API_FIELD_FLAGS = ("-f", "-F", "--field", "--raw-field")
 
 
@@ -129,17 +139,26 @@ def tokens(cmd, powershell=False):
     """Shell tokens of `cmd`: words without their quotes, and operators.
 
     `&`, `|`, `<` and `>` group into one operator (`&&`, `>>`, `2>&`); `;`,
-    `(`, `)` and newlines stand alone. A heredoc body becomes a `<<` `HEREDOC`
-    pair, a PowerShell here-string an empty word, and `#` comments are dropped.
+    `(`, `)` and newlines stand alone. A heredoc becomes a `<<` operator and a
+    word holding its body (in place, inside a `"$(cat <<EOF ...)"` word), a
+    PowerShell here-string a word holding its text, and `#` comments are dropped.
     """
-    cmd = HEREDOC.sub(lambda m: "<<HEREDOC" + m.group(3), cmd)
+    texts = []
+
+    def stash(text):
+        texts.append(text)
+        return "'\0%d\0'" % (len(texts) - 1)
+
     if powershell:
-        cmd = HERESTRING.sub("''", cmd)
+        cmd = HERESTRING.sub(lambda m: stash(m.group(2)), cmd)
+    # The body gets newlines around it so its first line starts a line.
+    cmd = HEREDOC.sub(lambda m: "<<" + stash("\n%s\n" % m.group(4)) + m.group(3), cmd)
     esc = "`" if powershell else "\\"
     toks, word, quoted, i, n = [], "", False, 0, len(cmd)
 
     def add(word, quoted):
         if word or quoted:
+            word = TEXT_MARKER.sub(lambda m: texts[int(m.group(1))], word)
             toks.append("'%s'" % word if quoted and word and set(word) <= QUOTE_KEPT else word)
 
     while i < n:
@@ -152,9 +171,11 @@ def tokens(cmd, powershell=False):
         elif c in "'\"":
             quoted, i = True, i + 1
             while i < n and cmd[i] != c:
-                if c == '"' and cmd[i] == esc and i + 1 < n and (powershell or cmd[i + 1] in '$`"\\\n'):
+                ch = cmd[i]
+                if c == '"' and ch == esc and i + 1 < n and (powershell or cmd[i + 1] in '$`"\\\n'):
                     i += 1
-                word += cmd[i]
+                    ch = PS_ESCAPES.get(cmd[i], cmd[i]) if powershell else cmd[i]
+                word += ch
                 i += 1
             i += 1
         elif c == "#" and not word and not quoted:
@@ -191,7 +212,7 @@ def is_redirect(t):
 def strip_prefixes(seg):
     """`seg` without leading assignments (`FOO=bar`, `$x =`) and words like `if` or `{`."""
     while seg:
-        if seg[0] in COMMAND_PREFIXES or re.match(r"^[A-Za-z_]\w*=", seg[0]):
+        if seg[0] in COMMAND_PREFIXES or ASSIGNMENT.match(seg[0]):
             seg = seg[1:]
         elif len(seg) > 1 and seg[1] == "=" and seg[0].startswith("$"):
             seg = seg[2:]
@@ -224,19 +245,36 @@ def resolve(base, path):
     return os.path.normpath(os.path.join(base, path))
 
 
+def expand_variables(seg, variables, powershell):
+    """`seg` with each `$name` / `${name}` word set earlier replaced by its value.
+    Records an assignment: `$x = value` in PowerShell (any case), and in bash a
+    command made only of `x=value` words."""
+    key = str.lower if powershell else str
+    if powershell and len(seg) == 3 and seg[0].startswith("$") and seg[1] == "=":
+        variables[key(seg[0])] = variables.get(key(seg[2]), seg[2])
+        return seg
+    seg = [variables.get(key(w), w) for w in seg]
+    if not powershell and seg and all(ASSIGNMENT.match(w) for w in seg):
+        for w in seg:
+            name, _, value = w.partition("=")
+            variables["$" + name] = variables["${%s}" % name] = variables.get(value, value)
+    return seg
+
+
 def commands(toks, cwd, powershell=False):
     """(directory, tokens) per simple command, after the directory changes before it.
 
     `cd` / `Set-Location` move only into a directory that exists (a failed `cd`
     leaves the shell where it was), `pushd` / `popd` keep a stack, and a bash
-    subshell's `cd`s end with it. PowerShell parentheses aren't subshells.
+    subshell's `cd`s end with it. PowerShell parentheses aren't subshells. A
+    variable set earlier in the command is replaced by its value.
     """
-    stack, subshells, seg = [], [], []
+    stack, subshells, seg, variables = [], [], [], {}
     for t in toks + [";"]:
         if not is_separator(t):
             seg.append(t)
             continue
-        seg = strip_prefixes(seg)
+        seg = strip_prefixes(expand_variables(seg, variables, powershell))
         name = seg[0].lower() if seg else ""
         if name in POPD_COMMANDS:
             if stack:
@@ -412,9 +450,14 @@ def herestring_file_write(cmd):
     return bool(PS_FILE_WRITE.search(PS_QUOTED.sub("''", HERESTRING.sub("@''@", cmd))))
 
 
-def read_file_text(cwd, path):
-    """`path`'s text, resolved from `cwd`; None for `-` (stdin) or an unreadable file."""
+def read_file_text(cwd, path, args=()):
+    """`path`'s text, resolved from `cwd`. For `-` (stdin), the heredoc (`<<`) or
+    here-string (`<<<`) in `args`. None when neither is known, or the file is
+    unreadable."""
     if path == "-":
+        for i, a in enumerate(args[:-1]):
+            if a in ("<<", "<<<"):
+                return args[i + 1]
         return None
     try:
         with open(resolve(cwd, path), "r", encoding="utf-8", errors="replace") as f:
@@ -438,7 +481,7 @@ def attribution_match(text):
 def scan_options(cwd, args, spec):
     """The text carried by options in `args` matching `spec` ({name: "value"|"file"}):
     `-x val`, `-xval` (two-character names only), `--long val`, `--long=val`. A
-    `file` value of `-` (stdin) or an unreadable path yields nothing."""
+    `file` value is read (`-` from a heredoc in `args`); if unreadable it yields nothing."""
     i = 0
     while i < len(args):
         a = args[i]
@@ -459,32 +502,42 @@ def scan_options(cwd, args, spec):
         if val is None:
             continue
         if kind == "file":
-            if val != "-":
-                text = read_file_text(cwd, val)
-                if text is not None:
-                    yield text
+            text = read_file_text(cwd, val, args)
+            if text is not None:
+                yield text
         else:
             yield val
 
 
+def json_strings(text):
+    """Every string in `text` when it is JSON, where a trailer's newlines are `\\n`."""
+    try:
+        stack = [json.loads(text)]
+    except ValueError:
+        return
+    while stack:
+        v = stack.pop()
+        if isinstance(v, str):
+            yield v
+        elif isinstance(v, (dict, list)):
+            stack.extend(v.values() if isinstance(v, dict) else v)
+
+
 def gh_api_texts(cwd, args):
     """Field values from `gh api` `-f`/`-F`/`--field`/`--raw-field key=value` and
-    `--input <file>`; a `@file` value is read as a file, `@-` is stdin (allowed)."""
+    `--input <file>` (and the strings in it, when JSON); a `@file` value is read
+    as a file, and `-`/`@-` (stdin) from a heredoc in `args`."""
     i = 0
     while i < len(args):
         a = args[i]
         kv = None
-        if a in ("--input",) and i + 1 < len(args):
-            text = read_file_text(cwd, args[i + 1])
+        if (a == "--input" and i + 1 < len(args)) or a.startswith("--input="):
+            path = args[i + 1] if a == "--input" else a.split("=", 1)[1]
+            i += 2 if a == "--input" else 1
+            text = read_file_text(cwd, path, args)
             if text is not None:
                 yield text
-            i += 2
-            continue
-        if a.startswith("--input="):
-            text = read_file_text(cwd, a.split("=", 1)[1])
-            if text is not None:
-                yield text
-            i += 1
+                yield from json_strings(text)
             continue
         if a in GH_API_FIELD_FLAGS and i + 1 < len(args):
             kv, i = args[i + 1], i + 2
@@ -498,11 +551,11 @@ def gh_api_texts(cwd, args):
         _, sep, val = kv.partition("=")
         if not sep:
             continue
-        if val.startswith("@") and val != "@-":
-            text = read_file_text(cwd, val[1:])
+        if val.startswith("@"):
+            text = read_file_text(cwd, val[1:], args)
             if text is not None:
                 yield text
-        elif val != "@-":
+        else:
             yield val
 
 
@@ -543,26 +596,34 @@ def split_git_clusters(args, with_value):
     return out
 
 
+def gh_word(args):
+    """(the first command word in `args`, lowercased, and `args` without it), or
+    ("", args). Skips options, and the value of `-R`/`--repo`, which gh takes
+    before and between its command words (`gh -R o/r pr create`)."""
+    i = 0
+    while i < len(args):
+        if not args[i].startswith("-"):
+            return args[i].lower(), args[:i] + args[i + 1:]
+        i += 2 if args[i] in GH_GLOBAL_WITH_ARG else 1
+    return "", args
+
+
 def gh_attribution_hit(cwd, seg):
     """(where, matched line) if a `gh` call in `seg` carries AI attribution, else None."""
-    if len(seg) < 2:
-        return None
-    group = seg[1].lower()
+    group, args = gh_word(seg[1:])
     if group == "api":
-        texts, where = gh_api_texts(cwd, seg[2:]), "gh api field value"
+        texts, where = gh_api_texts(cwd, args), "gh api field value"
     else:
-        if len(seg) < 3:
-            return None
-        action = seg[2].lower()
+        action, args = gh_word(args)
         if group == "pr" and action in GH_PR_ACTIONS:
             spec = dict(GH_BODY_OPTS)
             if action == "merge":
                 spec.update(GH_SUBJECT_OPTS)
-            texts, where = scan_options(cwd, seg[3:], spec), "PR body"
+            texts, where = scan_options(cwd, args, spec), "PR body"
         elif group == "issue" and action in GH_ISSUE_ACTIONS:
-            texts, where = scan_options(cwd, seg[3:], GH_BODY_OPTS), "issue body"
+            texts, where = scan_options(cwd, args, GH_BODY_OPTS), "issue body"
         elif group == "release" and action in GH_RELEASE_ACTIONS:
-            texts, where = scan_options(cwd, seg[3:], GH_NOTES_OPTS), "release notes"
+            texts, where = scan_options(cwd, args, GH_NOTES_OPTS), "release notes"
         else:
             return None
     for text in texts:
