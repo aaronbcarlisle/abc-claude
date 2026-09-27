@@ -35,7 +35,7 @@ gh repo clone aaronbcarlisle/abc-claude ~/src/abc-claude
 sh ~/src/abc-claude/install.sh
 ```
 
-With a clone you already have, run `git checkout master`, then `git pull --ff-only` in it first: the installer installs the clone's local `master` branch, whatever is checked out.
+With a clone you already have, update its `master` first: run `git checkout master`, then `git pull --ff-only`. The installer always installs the clone's local `master` branch, even when another branch is checked out.
 
 On Windows, run `powershell -ExecutionPolicy Bypass -File <dir>\install.ps1` instead. The installer adopts the committed work on the clone's `master` into `~/.claude` and sets `origin` to the clone's `origin`. Uncommitted edits in the clone aren't carried over. Delete the clone afterwards.
 
