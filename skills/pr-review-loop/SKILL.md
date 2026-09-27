@@ -10,6 +10,7 @@ allowed-tools:
   - Bash(npx:*)
   - Bash(curl:*)
   - Bash(sleep:*)
+  - Bash(bash:*)
   - Read
   - Edit
   - Write

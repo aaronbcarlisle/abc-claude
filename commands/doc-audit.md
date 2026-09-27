@@ -1,6 +1,6 @@
 ---
 description: Audit all docs against codebase - update TODOs, remove stale content
-allowed-tools: Bash(find:*), Bash(grep:*), Bash(git:*)
+allowed-tools: Bash(find:*), Bash(grep:*), Bash(git:*), Read, Edit, Write, Glob, Grep
 ---
 
 # Documentation Audit
