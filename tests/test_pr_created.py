@@ -96,6 +96,16 @@ class PrCreatedTest(unittest.TestCase):
         self.assertShip(self.run_hook(command="git branch -d old && gh pr create --title T --body B"))
         self.assertIsNone(self.run_hook(command="git push && gh pr create -d --title T"))
 
+    def test_an_unquoted_newline_ends_the_create_args(self):
+        # A newline separates commands like `;`, so the next line's `-d` isn't gh pr create's.
+        for nl in ("\n", "\r\n"):
+            with self.subTest(nl=nl):
+                self.assertShip(self.run_hook(command="gh pr create --title T%sgit branch -d old" % nl))
+                self.assertShip(self.run_hook(command="git branch -d old%sgh pr create --title T" % nl))
+                self.assertIsNone(self.run_hook(command="git push%sgh pr create -d --title T" % nl))
+        # A quoted newline stays part of its word.
+        self.assertIsNone(self.run_hook(command='gh pr create --body "line 1\nline 2" -d --title T'))
+
     def test_draft_word_inside_quoted_body_is_not_a_draft(self):
         self.assertShip(self.run_hook(command='gh pr create --title T --body "use -d or --draft next time"'))
 

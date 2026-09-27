@@ -32,7 +32,7 @@ import time
 PR_URL = re.compile(r"https://github\.com/[\w.-]+/[\w.-]+/pull/(\d+)")
 GH_PR_CREATE = re.compile(r"\bgh\s+pr\s+create\b")
 SESSION_ID = re.compile(r"^[\w-]+$")
-SEPARATORS = "&|;()"
+SEPARATORS = "&|;()\n"  # an unquoted newline ends a command like `;` does
 DRAFT_TRUE = ("1", "t", "T", "TRUE", "true", "True")  # strconv.ParseBool's true values
 MARKER_TTL = 3600
 MESSAGE = "PR #{n} opened ({url}). Continue in this turn: invoke the pr-review-loop skill with `ship #{n}`."
@@ -45,8 +45,9 @@ def state_dir():
 
 def split_words(command):
     """The command's words with quotes and backslash escapes removed, and None for each unquoted
-    shell separator (`&&`, `||`, `|`, `;`, `(`, `)`, `&`). A quoted separator (`--body "&&"`) stays
-    part of its word. An unclosed quote runs to the end of the command."""
+    shell separator (`&&`, `||`, `|`, `;`, `(`, `)`, `&`, a newline; the carriage return of
+    a CRLF is plain whitespace). A quoted separator (`--body "&&"`) stays part of its word. An unclosed quote runs
+    to the end of the command."""
     words, word, started, quote = [], "", False, None
     chars = iter(command)
     for c in chars:

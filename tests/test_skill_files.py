@@ -76,6 +76,12 @@ CLEANUP_RULES = ["Bash(%s)" % CLEANUP] + ["Bash(%s --test '%s')" % (CLEANUP, tes
     "python -m unittest discover -s tests", "npm test", "pnpm test")]
 # The gate discovery's command for a tests/test_*.py repo, pre-approved as that one exact command.
 GATE_RULE = "Bash(python -m unittest discover -s tests)"
+# Phase 6's only merge: tied to the head SHA the conditions were checked against.
+MERGE = "gh pr merge --squash --match-head-commit <head> <PR>"
+MERGE_RULE = "Bash(gh pr merge --squash *)"
+# Phase 6's condition on the last Phase 4 wait.
+PHASE_6_WAIT = ("the last Phase 4 wait didn't print `review status unknown`, `reviews still pending` "
+                "or `feedback query failed`")
 
 
 class SkillFilesTest(unittest.TestCase):
@@ -193,9 +199,14 @@ class ShipLoopTest(unittest.TestCase):
     def test_pr_review_loop_merges_only_through_phase_6(self):
         text = body(skill("pr-review-loop"))
         self.assertIn("## Phase 6", text)
-        self.assertIn("gh pr merge --squash <PR>", text)
+        self.assertIn(MERGE, text)
         # Every merge command uses the argument order of the `Bash(gh pr merge --squash *)` allow rule.
-        self.assertEqual(re.findall(r"gh pr merge\b\S*(?: \S+){0,2}", text), ["gh pr merge --squash <PR>"])
+        self.assertEqual(re.findall(r"gh pr merge\b\S*(?: [^\s`]+){0,4}", text), [MERGE])
+        with open(os.path.join(REPO, "settings.json"), encoding="utf-8") as f:
+            allow = json.load(f)["permissions"]["allow"]
+        self.assertIn(MERGE_RULE, allow)
+        self.assertTrue(rule_matches(MERGE_RULE, MERGE))
+        self.assertTrue(rule_matches(MERGE_RULE, "gh pr merge --squash --match-head-commit 0123abc 12"))
         self.assertIn("no-automerge", text)
         self.assertIn("mergeStateStatus", text)
         self.assertIn('post_merge_cleanup.py" --repo . --here', text)
@@ -227,9 +238,62 @@ class ShipLoopTest(unittest.TestCase):
         self.assertIn("`feedback query failed` aren't feedback: don't return to Phase 1 for them", phase4)
         self.assertIn('"blocked: feedback query failed"', phase4)
         phase6 = section(text, "## Phase 6")
-        self.assertIn("the last Phase 4 wait didn't print `review status unknown` or `feedback query failed`",
-                      phase6)
+        self.assertIn(PHASE_6_WAIT, phase6)
         self.assertIn('"blocked: feedback query failed"', phase6)
+
+    def test_reviews_still_pending_after_the_cap_are_never_clean(self):
+        # A reviewer still pending when the 15-minute poll ends must not let the wait count as clean.
+        text = body(skill("pr-review-loop"))
+        phase4 = section(text, "## Phase 4")
+        pending = '[ "$w" != 0 ] && [ "$w" != error ] && echo "reviews still pending after 15 min"'
+        self.assertIn(pending, phase4)
+        # It runs after the poll loop and before the quiet window.
+        self.assertLess(phase4.index("     done\n"), phase4.index(pending))
+        self.assertLess(phase4.index(pending), phase4.index("for i in 1 2 3 4; do events"))
+        self.assertIn("`reviews still pending after 15 min` and `feedback query failed` aren't feedback", phase4)
+        clean = re.search(r"^- \*\*Clean:\*\*.*$", phase4, re.M).group(0)
+        self.assertIn("`reviews still pending`", clean)
+        pending_exit = re.search(r"^- \*\*Reviews still pending:\*\*.*$", phase4, re.M).group(0)
+        self.assertIn("Run one more Phase 4 wait", pending_exit)
+        self.assertIn('report "blocked: reviews still pending" and stop without merging', pending_exit)
+        phase6 = section(text, "## Phase 6")
+        self.assertIn(PHASE_6_WAIT, phase6)
+        self.assertIn('"blocked: reviews still pending"', phase6)
+        owner = re.search(r"^- \*\*Only the owner can resolve it\*\*.*$", phase6, re.M).group(0)
+        self.assertIn("reviews still pending", owner)
+
+    def test_the_review_wait_counts_only_feedback_after_phase_1_read(self):
+        # With HEAD's commit time, an iteration that pushed nothing re-prints the same feedback on every
+        # wait, returns to Phase 1, finds nothing and waits again until max iterations.
+        text = body(skill("pr-review-loop"))
+        phase1 = section(text, "## Phase 1")
+        record = "date -u +%Y-%m-%dT%H:%M:%SZ"
+        self.assertIn(record, phase1)
+        self.assertLess(phase1.index(record), phase1.index("### 1.1"))  # before anything is read
+        self.assertIn("remember it as `<phase-1-time>`", phase1)
+        self.assertIn("Phase 1 itself still reads everything", phase1)
+        phase4 = section(text, "## Phase 4")
+        self.assertNotIn("git log", phase4)
+        self.assertNotIn("%cd", phase4)
+        since = re.search(r"^\s*since=(\S*)", phase4, re.M).group(1)
+        self.assertEqual(since, "<phase-1-time>")
+        self.assertIn("That replaces HEAD's commit time", phase4)
+        # The filters themselves are unchanged: reviews by submitted_at, comments by update time.
+        self.assertIn('select(.submitted_at > \\"$since\\"', phase4)
+        self.assertEqual(phase4.count("/comments?since=$since"), 2)
+
+    def test_ship_is_honoured_only_as_the_first_argument_word(self):
+        # `/pr-review-loop #12 tighten the ship skill wording` must not auto-merge.
+        data = frontmatter(skill("pr-review-loop"))
+        self.assertTrue(data.get("argument-hint", "").startswith("[ship] "))
+        args = section(body(skill("pr-review-loop")), "## Interpret the arguments")
+        self.assertNotIn("`ship` anywhere in the arguments", args)
+        self.assertIn("`ship` as the first argument word enables Phase 6", args)
+        self.assertIn("`ship` anywhere else is an ordinary word of the extra instructions", args)
+        # Both hand-offs put `ship` first.
+        self.assertIn("invoke the `pr-review-loop` skill with `ship #<N>`", section(body(skill("ship")), "## 6. Hand off"))
+        hook = body(os.path.join(REPO, "hooks", "pr_created.py"))
+        self.assertIn("with `ship #{n}`", re.search(r'^MESSAGE = .*$', hook, re.M).group(0))
 
     def test_the_review_wait_outlasts_its_script_and_a_cut_off_wait_is_unknown(self):
         phase4 = section(body(skill("pr-review-loop")), "## Phase 4")
@@ -271,20 +335,32 @@ class ShipLoopTest(unittest.TestCase):
         self.assertIn("report it and stop without merging.", phase6)
         self.assertLess(phase6.index("**Only the owner can resolve it**"),
                         phase6.index("Merge only once every condition holds"))
-        self.assertLess(phase6.index("Merge only once every condition holds"),
-                        phase6.index("gh pr merge --squash <PR>"))
+        self.assertLess(phase6.index("Merge only once every condition holds"), phase6.index(MERGE))
 
     def test_phase_6_stops_after_a_failed_merge(self):
         # The SHA query, the cleanup and its handoff line would otherwise record a merge that didn't happen.
         phase6 = section(body(skill("pr-review-loop")), "## Phase 6")
-        stop = ("If the merge exits non-zero, report its error and stop: don't query the merge SHA, "
+        stop = ("Otherwise report its error and stop: don't query the merge SHA, "
                 "don't run the cleanup, and write no handoff line.")
         self.assertIn(stop, phase6)
         self.assertIn("If it prints nothing or `null`, the merge isn't confirmed: report that and stop the same way.",
                       phase6)
-        order = [phase6.index(s) for s in ("gh pr merge --squash <PR>", stop, "--json mergeCommit",
+        order = [phase6.index(s) for s in (MERGE, stop, "--json mergeCommit",
                                            "If it prints nothing or `null`", 'post_merge_cleanup.py" --repo')]
         self.assertEqual(order, sorted(order))
+
+    def test_phase_6_merges_only_the_checked_head(self):
+        # A push between the head check and the merge (e.g. during the UNKNOWN re-query) must not be
+        # merged unchecked: --match-head-commit makes GitHub refuse it, and a moved head loops back.
+        phase6 = section(body(skill("pr-review-loop")), "## Phase 6")
+        self.assertIn("head: .headRefOid", phase6)  # `head` is the SHA the conditions are checked against
+        self.assertIn("Pass the `head` SHA the conditions were checked against", phase6)
+        moved = ("If the merge exits non-zero, check whether the head moved: "
+                 "`gh pr view <PR> --json headRefOid --jq .headRefOid`. If it no longer equals `head`, "
+                 "that's `head` moved: go back to Phase 1.")
+        self.assertIn(moved, phase6)
+        self.assertLess(phase6.index(MERGE), phase6.index(moved))
+        self.assertLess(phase6.index(moved), phase6.index("Otherwise report its error and stop"))
 
     def test_phase_6_waits_out_unknown_merge_state_with_monitor(self):
         phase6 = section(body(skill("pr-review-loop")), "## Phase 6")

@@ -40,7 +40,7 @@ allowed-tools:
 - Arguments: `$ARGUMENTS`
 
 ## Interpret the arguments
-- `ship` anywhere in the arguments enables Phase 6: once the loop exits clean, merge and clean up.
+- `ship` as the first argument word enables Phase 6: once the loop exits clean, merge and clean up. `ship` anywhere else is an ordinary word of the extra instructions (`#12 tighten the ship skill wording` never merges). /ship and the pr_created hook both hand off with `ship #<N>`.
 - Inside /ship, the pr_created hook's note (sent only when /ship's marker was missing) arrives right after `gh pr create`, before /ship's own hand-off: hand off once. A second `ship #N` for a PR this session's loop is already running on is a duplicate: ignore it and carry on with the running loop.
 - A bare integer is max iterations (default 25).
 - `#N` tokens are the PRs to work on. If none are given, use the current-branch PR. If that is `NONE`, stop and tell the user there is no PR for this branch.
@@ -78,6 +78,12 @@ A stack is a chain of PRs where each one's base is the previous one's head branc
 ## Phase 1 — Assess (read everything before changing anything)
 
 Run for each PR being worked on.
+
+First, once per iteration and before reading any PR, record when this read starts and remember it as `<phase-1-time>`:
+```bash
+date -u +%Y-%m-%dT%H:%M:%SZ
+```
+Phase 4's wait counts only feedback posted or edited after this time as new. Phase 1 itself still reads everything, old and new.
 
 ### 1.1 Review threads — GraphQL is the only source of truth
 Run the bundled script:
@@ -190,12 +196,13 @@ One iteration is one push cycle. After each push:
 2. Wait for reviewers with the **Monitor** tool (`timeout_ms: 1500000`). The command below does two things, then prints `quiet window over` and exits:
    - It polls every 30 s until no review request is pending and every check run on the head SHA whose name contains `review` has finished, up to 15 minutes. It waits at least one minute, so a review request that registers late isn't missed.
    - Then it holds a 2-minute quiet window for summary edits.
-   Throughout, it prints one line per new or edited review, inline comment or PR comment since the push commit.
+   Throughout, it prints one line per review, inline comment or PR comment posted or edited after `<phase-1-time>`, the time recorded at the start of this iteration's Phase 1. That replaces HEAD's commit time: an iteration that pushed nothing (it only declined items, or a reviewer left a comment-free review) would otherwise see the same old feedback as new on every wait, and loop until max iterations without merging.
    - A failed `gh` query (auth, API or network error) never counts as "nothing pending": `waiting` prints `error`, which isn't `0`, so the poll retries 30 s later. It prints `review status query failed` once. If the last poll still failed when the 15 minutes end, it prints `review status unknown: gh query failed`. That means the wait is **not clean**: don't merge, report it as blocked (see the exit rules below).
+   - If a review request or `review` check run is still open when the 15 minutes end, it prints `reviews still pending after 15 min`. A slow reviewer hasn't landed yet, so that wait is **not clean** either.
    - A failed feedback query in `events` never counts as "no feedback" either: it prints `feedback query failed` (once per wait, like every line). Feedback may have arrived unseen, so that wait is **not clean** either.
    ```bash
    sha=$(git rev-parse HEAD)
-   since=$(TZ=UTC git log -1 --date=format-local:%Y-%m-%dT%H:%M:%SZ --format=%cd)
+   since=<phase-1-time>   # recorded at the start of this iteration's Phase 1, not HEAD's commit time
    events() {
      gh api "repos/{owner}/{repo}/pulls/<PR>/reviews" --jq ".[] | select(.submitted_at > \"$since\" and .user.login != \"<me>\") | \"review \(.id) by \(.user.login)\"" || echo "feedback query failed"
      gh api "repos/{owner}/{repo}/pulls/<PR>/comments?since=$since" --jq ".[] | select(.user.login != \"<me>\") | \"inline \(.id) by \(.user.login) at \(.updated_at)\"" || echo "feedback query failed"
@@ -217,18 +224,20 @@ One iteration is one push cycle. After each push:
        sleep 30
      done
      [ "$w" = error ] && echo "review status unknown: gh query failed"
+     [ "$w" != 0 ] && [ "$w" != error ] && echo "reviews still pending after 15 min"
      for i in 1 2 3 4; do events; sleep 30; done
    } | while IFS= read -r ev; do   # print each event once
      case "$seen" in *"|$ev|"*) ;; *) seen="$seen|$ev|"; echo "$ev" ;; esac
    done
    echo "quiet window over"
    ```
-   The `?since=` filter matches on update time, so a bot editing its summary in place shows up as a new line. `review status query failed`, `review status unknown: …` and `feedback query failed` aren't feedback: don't return to Phase 1 for them. If the Monitor ends at its deadline without printing `quiet window over`, treat it as `review status unknown`: run the wait once more, then report blocked.
+   The `?since=` filter matches on update time, so a bot editing its summary in place shows up as a new line. `review status query failed`, `review status unknown: …`, `reviews still pending after 15 min` and `feedback query failed` aren't feedback: don't return to Phase 1 for them. If the Monitor ends at its deadline without printing `quiet window over`, treat it as `review status unknown`: run the wait once more, then report blocked.
 3. If new feedback appears, stop the monitor with TaskStop and return to Phase 1. Phase 1 re-reads everything, so anything that lands later is caught on the next iteration.
 
 Exit when any of these is true:
-- **Clean:** the sweep shows 0 open threads on every PR, CI is green, no new feedback arrived during the quiet window, and the wait didn't print `review status unknown` or `feedback query failed`. With `ship`, go to Phase 6, then Phase 5.
+- **Clean:** the sweep shows 0 open threads on every PR, CI is green, no new feedback arrived during the quiet window, and the wait didn't print `review status unknown`, `reviews still pending` or `feedback query failed`. With `ship`, go to Phase 6, then Phase 5.
 - **Review status unknown or feedback query failed:** the wait printed `review status unknown: gh query failed` or `feedback query failed`, so it never established that reviewers finished or that no feedback arrived. That isn't clean. Run one more Phase 4 wait; if it prints either line again, report "blocked: review status unknown (gh query failed)" or "blocked: feedback query failed" (whichever it printed) and stop without merging.
+- **Reviews still pending:** the wait printed `reviews still pending after 15 min`, so a requested review or `review` check run hadn't finished. That isn't clean, and it isn't feedback. Run one more Phase 4 wait; if it prints it again, report "blocked: reviews still pending" and stop without merging.
 - **Max iterations reached:** report the remaining items.
 - **Blocked:** every remaining item needs user input, so report and ask.
 
@@ -271,7 +280,7 @@ All of these must hold:
 - the checks query prints `0`. If it instead fails with `no checks reported on the '<branch>' branch`, the repo runs no CI on this PR: count that as `0`. Any other failure is a failed query: run it once more, and if it fails again report "blocked: checks query failed".
 - `threads.sh` exits 0 and prints nothing. A non-zero exit is a failed query, not "no threads": run it once more, and if it fails again report "blocked: review threads query failed".
 - no item in this loop's task list is waiting on the owner;
-- the last Phase 4 wait didn't print `review status unknown` or `feedback query failed`. Otherwise report "blocked: review status unknown (gh query failed)" or "blocked: feedback query failed".
+- the last Phase 4 wait didn't print `review status unknown`, `reviews still pending` or `feedback query failed`. Otherwise report "blocked: review status unknown (gh query failed)", "blocked: reviews still pending" or "blocked: feedback query failed".
 - `mergeStateStatus` is `CLEAN`. On `UNKNOWN`, re-query with the **Monitor** tool, never a foreground `sleep` (`timeout_ms: 180000`; it prints the state every 30 s, up to 3 times, and exits once it isn't `UNKNOWN`):
   ```bash
   for i in 1 2 3; do sleep 30; s=$(gh pr view <PR> --json mergeStateStatus --jq .mergeStateStatus); echo "$s"; [ "$s" != UNKNOWN ] && break; done
@@ -282,13 +291,13 @@ To tell pending checks from failing ones, drop `| length` from the checks query:
 
 If a condition fails otherwise:
 - **The loop can fix it** (`head` moved, new unresolved threads, a failing check): go back to Phase 1.
-- **Only the owner can resolve it** (draft or `no-automerge`, stacked, a failed threads or checks query, an item waiting on the owner, review status unknown, a failed feedback query, a merge state that isn't `CLEAN` with no checks pending): report it and stop without merging.
+- **Only the owner can resolve it** (draft or `no-automerge`, stacked, a failed threads or checks query, an item waiting on the owner, review status unknown, reviews still pending, a failed feedback query, a merge state that isn't `CLEAN` with no checks pending): report it and stop without merging.
 
-Merge only once every condition holds and no check is pending:
+Merge only once every condition holds and no check is pending. Pass the `head` SHA the conditions were checked against, so GitHub refuses the merge if anything landed on the PR since (for example during the `UNKNOWN` re-query):
 ```bash
-gh pr merge --squash <PR>          # this argument order matches the permission allow rule
+gh pr merge --squash --match-head-commit <head> <PR>   # this argument order matches the permission allow rule
 ```
-If the merge exits non-zero, report its error and stop: don't query the merge SHA, don't run the cleanup, and write no handoff line. Otherwise read the merge SHA:
+If the merge exits non-zero, check whether the head moved: `gh pr view <PR> --json headRefOid --jq .headRefOid`. If it no longer equals `head`, that's `head` moved: go back to Phase 1. Otherwise report its error and stop: don't query the merge SHA, don't run the cleanup, and write no handoff line. If the merge succeeded, read the merge SHA:
 ```bash
 gh pr view <PR> --json mergeCommit --jq .mergeCommit.oid
 ```
