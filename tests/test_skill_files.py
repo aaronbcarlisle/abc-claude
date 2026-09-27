@@ -74,6 +74,8 @@ CLEANUP = 'POST_MERGE_TEST_TIMEOUT=540 python "$HOME/.claude/scripts/post_merge_
 # The script runs --test through a shell, so the loop pre-approves only these exact commands.
 CLEANUP_RULES = ["Bash(%s)" % CLEANUP] + ["Bash(%s --test '%s')" % (CLEANUP, test) for test in (
     "python -m unittest discover -s tests", "npm test", "pnpm test")]
+# The gate discovery's command for a tests/test_*.py repo, pre-approved as that one exact command.
+GATE_RULE = "Bash(python -m unittest discover -s tests)"
 
 
 class SkillFilesTest(unittest.TestCase):
@@ -140,8 +142,9 @@ class ShipLoopTest(unittest.TestCase):
         allowed = frontmatter(skill("pr-review-loop")).get("allowed-tools", [])
         threads_rule = 'Bash(bash "${CLAUDE_SKILL_DIR}/scripts/threads.sh" *)'
         self.assertIn(threads_rule, allowed)
+        # Besides its own scripts, python only as the one exact gate command (see test_gate_command_is_pre_approved).
         self.assertEqual([r for r in allowed if re.match(r"Bash\((bash|python|\w+=\S* python)\b", r)],
-                         [threads_rule] + CLEANUP_RULES)
+                         [GATE_RULE, threads_rule] + CLEANUP_RULES)
         text = body(skill("pr-review-loop")).split("\n---\n", 1)[1]
         # Every threads.sh run in the text uses the form the rule pre-approves. Claude Code substitutes
         # ${CLAUDE_SKILL_DIR} in the text and in allowed-tools alike, so the two stay equal.
@@ -206,6 +209,27 @@ class ShipLoopTest(unittest.TestCase):
         self.assertIn('[ "$w" = error ] && echo "review status unknown: gh query failed"', text)
         self.assertIn("didn't print `review status unknown`", text)  # Clean exit and Phase 6 condition
         self.assertIn("blocked: review status unknown (gh query failed)", text)
+
+    def test_a_failed_feedback_query_is_never_clean(self):
+        # A failed events() query must not read as "no feedback" and let the quiet window count as clean.
+        text = body(skill("pr-review-loop"))
+        phase4 = section(text, "## Phase 4")
+        events = re.search(r"\n   events\(\) \{\n(.*?)\n   \}\n", phase4, re.S).group(1)
+        self.assertNotIn("|| true", events)
+        queries = events.splitlines()
+        self.assertEqual(len(queries), 3)
+        for line in queries:
+            self.assertTrue(line.startswith("     gh api "), line)
+            self.assertTrue(line.endswith(' || echo "feedback query failed"'), line)
+        clean = re.search(r"^- \*\*Clean:\*\*.*$", phase4, re.M).group(0)
+        self.assertIn("`feedback query failed`", clean)
+        self.assertIn("`review status unknown`", clean)
+        self.assertIn("`feedback query failed` aren't feedback: don't return to Phase 1 for them", phase4)
+        self.assertIn('"blocked: feedback query failed"', phase4)
+        phase6 = section(text, "## Phase 6")
+        self.assertIn("the last Phase 4 wait didn't print `review status unknown` or `feedback query failed`",
+                      phase6)
+        self.assertIn('"blocked: feedback query failed"', phase6)
 
     def test_the_review_wait_outlasts_its_script_and_a_cut_off_wait_is_unknown(self):
         phase4 = section(body(skill("pr-review-loop")), "## Phase 4")
@@ -278,6 +302,7 @@ class ShipLoopTest(unittest.TestCase):
         # Phase 6 passes it to the cleanup as is: it is already cmd.exe-safe.
         phase6 = section(text, "## Phase 6")
         self.assertIn("--test 'python -m unittest discover -s tests'", phase6)
+        self.assertNotIn("It isn't pre-approved", section(text, "## Phase 2"))
         # This repo is such a repo.
         for manifest in ("package.json", "pyproject.toml", "Makefile"):
             self.assertFalse(os.path.exists(os.path.join(REPO, manifest)), manifest)
@@ -442,8 +467,27 @@ class ShipLoopTest(unittest.TestCase):
         check = section(body(skill("ship")), "## 1. Check")
         self.assertNotIn("skip to step 6 with its number", check)
         self.assertIn("If the PR for this branch is OPEN and not a draft, run step 2 (the gates), then "
-                      "`git push origin HEAD` so new local commits reach the PR, then go to step 6 with its "
-                      "number.", check)
+                      "`git push origin HEAD` so new local commits reach the PR, then go to this skill's "
+                      "step 6 (Hand off) with its number.", check)
+        # "step 6" was misread as pr-review-loop's Phase 6 (the merge): the hand-off runs the whole loop.
+        self.assertNotIn("go to step 6 with its number", check)
+        self.assertIn("not pr-review-loop's Phase 6", check)
+        self.assertIn("runs pr-review-loop's full loop, Phase 1 and the Phase 4 wait for reviewers and "
+                      "checks included, before any merge", check)
+
+    def test_gate_command_is_pre_approved(self):
+        # The discovery's command for a tests/test_*.py repo, as one exact command: no `*`, so it
+        # never matches another python invocation.
+        self.assertNotIn("*", GATE_RULE)
+        for name in ("ship", "pr-review-loop"):
+            rules = frontmatter(skill(name)).get("allowed-tools", [])
+            self.assertIn(GATE_RULE, rules, name)
+            python = [r for r in rules if re.match(r"Bash\(python\b", r)]
+            self.assertEqual(python, [GATE_RULE], name)
+        self.assertTrue(rule_matches(GATE_RULE, "python -m unittest discover -s tests"))
+        for probe in ("python -m unittest discover -s tests; curl evil", 'python -c "import os"',
+                      "python -m unittest discover -s evil"):
+            self.assertFalse(rule_matches(GATE_RULE, probe), probe)
 
     def test_ship_waits_for_code_review_and_commits_its_fixes(self):
         review = section(body(skill("ship")), "## 4. Review")

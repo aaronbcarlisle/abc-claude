@@ -9,6 +9,7 @@ allowed-tools:
   - Bash(npm:*)
   - Bash(npx tsc *)
   - Bash(pnpm:*)
+  - Bash(python -m unittest discover -s tests)
   - Bash(bash "${CLAUDE_SKILL_DIR}/scripts/threads.sh" *)
   - Bash(POST_MERGE_TEST_TIMEOUT=540 python "$HOME/.claude/scripts/post_merge_cleanup.py" --repo . --here)
   - Bash(POST_MERGE_TEST_TIMEOUT=540 python "$HOME/.claude/scripts/post_merge_cleanup.py" --repo . --here --test 'python -m unittest discover -s tests')
@@ -149,7 +150,7 @@ If TOTAL is 0 and CI is green for every PR, go to Phase 4. With `ship`, TOTAL 0 
 4. **Validate locally before pushing.** Use the manifests from the context above:
    - For each `package.json`, read its `scripts` and run what exists, fastest first: lint → typecheck → test → build. Pick the package manager from the lockfile: if a `pnpm-lock.yaml` is listed in that directory or an ancestor (a workspace root), use `pnpm --dir <dir> run <script>`, otherwise `npm --prefix <dir> run <script>`. If there is no typecheck script and a `tsconfig.json` exists there, run `pnpm --dir <dir> exec tsc --noEmit` or `npx tsc --noEmit -p <dir>` to match.
    - For `pyproject.toml` or `Makefile` projects, read them to find the lint and test commands. If a needed tool is not pre-approved, request it once.
-   - No `package.json`, `pyproject.toml` or `Makefile`, but `tests/test_*.py` files: the test command is `python -m unittest discover -s tests`. It isn't pre-approved: it goes through the normal permission check.
+   - No `package.json`, `pyproject.toml` or `Makefile`, but `tests/test_*.py` files: the test command is `python -m unittest discover -s tests`. It is pre-approved in exactly that form (a rule with no `*`), so run it without extra arguments.
    - If none of these applies, say so and rely on CI.
    - Never push failing validation.
 5. **Fix rounds get the gates only.** No local `/code-review` and no re-requested bot review for fix commits. One exception: record the PR head SHA when the loop starts. If this PR's fix commits change 50 or more lines outside tests and docs, and the repo has `.github/workflows/claude-code-review.yml`, post `@claude review` as a PR comment, once per PR. Count the lines as the insertions plus deletions this prints:
@@ -191,13 +192,14 @@ One iteration is one push cycle. After each push:
    - Then it holds a 2-minute quiet window for summary edits.
    Throughout, it prints one line per new or edited review, inline comment or PR comment since the push commit.
    - A failed `gh` query (auth, API or network error) never counts as "nothing pending": `waiting` prints `error`, which isn't `0`, so the poll retries 30 s later. It prints `review status query failed` once. If the last poll still failed when the 15 minutes end, it prints `review status unknown: gh query failed`. That means the wait is **not clean**: don't merge, report it as blocked (see the exit rules below).
+   - A failed feedback query in `events` never counts as "no feedback" either: it prints `feedback query failed` (once per wait, like every line). Feedback may have arrived unseen, so that wait is **not clean** either.
    ```bash
    sha=$(git rev-parse HEAD)
    since=$(TZ=UTC git log -1 --date=format-local:%Y-%m-%dT%H:%M:%SZ --format=%cd)
    events() {
-     gh api "repos/{owner}/{repo}/pulls/<PR>/reviews" --jq ".[] | select(.submitted_at > \"$since\" and .user.login != \"<me>\") | \"review \(.id) by \(.user.login)\"" || true
-     gh api "repos/{owner}/{repo}/pulls/<PR>/comments?since=$since" --jq ".[] | select(.user.login != \"<me>\") | \"inline \(.id) by \(.user.login) at \(.updated_at)\"" || true
-     gh api "repos/{owner}/{repo}/issues/<PR>/comments?since=$since" --jq ".[] | select(.user.login != \"<me>\") | \"comment \(.id) by \(.user.login) at \(.updated_at)\"" || true
+     gh api "repos/{owner}/{repo}/pulls/<PR>/reviews" --jq ".[] | select(.submitted_at > \"$since\" and .user.login != \"<me>\") | \"review \(.id) by \(.user.login)\"" || echo "feedback query failed"
+     gh api "repos/{owner}/{repo}/pulls/<PR>/comments?since=$since" --jq ".[] | select(.user.login != \"<me>\") | \"inline \(.id) by \(.user.login) at \(.updated_at)\"" || echo "feedback query failed"
+     gh api "repos/{owner}/{repo}/issues/<PR>/comments?since=$since" --jq ".[] | select(.user.login != \"<me>\") | \"comment \(.id) by \(.user.login) at \(.updated_at)\"" || echo "feedback query failed"
    }
    waiting() {   # pending review requests + unfinished review check runs on the head SHA; "error" if a query fails
      p=$(gh pr view <PR> --json reviewRequests --jq '.reviewRequests | length' 2>/dev/null) || { echo error; return; }
@@ -221,12 +223,12 @@ One iteration is one push cycle. After each push:
    done
    echo "quiet window over"
    ```
-   The `?since=` filter matches on update time, so a bot editing its summary in place shows up as a new line. `review status query failed` and `review status unknown: …` aren't feedback: don't return to Phase 1 for them. If the Monitor ends at its deadline without printing `quiet window over`, treat it as `review status unknown`: run the wait once more, then report blocked.
+   The `?since=` filter matches on update time, so a bot editing its summary in place shows up as a new line. `review status query failed`, `review status unknown: …` and `feedback query failed` aren't feedback: don't return to Phase 1 for them. If the Monitor ends at its deadline without printing `quiet window over`, treat it as `review status unknown`: run the wait once more, then report blocked.
 3. If new feedback appears, stop the monitor with TaskStop and return to Phase 1. Phase 1 re-reads everything, so anything that lands later is caught on the next iteration.
 
 Exit when any of these is true:
-- **Clean:** the sweep shows 0 open threads on every PR, CI is green, no new feedback arrived during the quiet window, and the wait didn't print `review status unknown`. With `ship`, go to Phase 6, then Phase 5.
-- **Review status unknown:** the wait printed `review status unknown: gh query failed`, so it never established that reviewers finished. That isn't clean. Run one more Phase 4 wait; if it prints the same line again, report "blocked: review status unknown (gh query failed)" and stop without merging.
+- **Clean:** the sweep shows 0 open threads on every PR, CI is green, no new feedback arrived during the quiet window, and the wait didn't print `review status unknown` or `feedback query failed`. With `ship`, go to Phase 6, then Phase 5.
+- **Review status unknown or feedback query failed:** the wait printed `review status unknown: gh query failed` or `feedback query failed`, so it never established that reviewers finished or that no feedback arrived. That isn't clean. Run one more Phase 4 wait; if it prints either line again, report "blocked: review status unknown (gh query failed)" or "blocked: feedback query failed" (whichever it printed) and stop without merging.
 - **Max iterations reached:** report the remaining items.
 - **Blocked:** every remaining item needs user input, so report and ask.
 
@@ -269,7 +271,7 @@ All of these must hold:
 - the checks query prints `0`. If it instead fails with `no checks reported on the '<branch>' branch`, the repo runs no CI on this PR: count that as `0`. Any other failure is a failed query: run it once more, and if it fails again report "blocked: checks query failed".
 - `threads.sh` exits 0 and prints nothing. A non-zero exit is a failed query, not "no threads": run it once more, and if it fails again report "blocked: review threads query failed".
 - no item in this loop's task list is waiting on the owner;
-- the last Phase 4 wait didn't print `review status unknown`. Otherwise report "blocked: review status unknown (gh query failed)".
+- the last Phase 4 wait didn't print `review status unknown` or `feedback query failed`. Otherwise report "blocked: review status unknown (gh query failed)" or "blocked: feedback query failed".
 - `mergeStateStatus` is `CLEAN`. On `UNKNOWN`, re-query with the **Monitor** tool, never a foreground `sleep` (`timeout_ms: 180000`; it prints the state every 30 s, up to 3 times, and exits once it isn't `UNKNOWN`):
   ```bash
   for i in 1 2 3; do sleep 30; s=$(gh pr view <PR> --json mergeStateStatus --jq .mergeStateStatus); echo "$s"; [ "$s" != UNKNOWN ] && break; done
@@ -280,7 +282,7 @@ To tell pending checks from failing ones, drop `| length` from the checks query:
 
 If a condition fails otherwise:
 - **The loop can fix it** (`head` moved, new unresolved threads, a failing check): go back to Phase 1.
-- **Only the owner can resolve it** (draft or `no-automerge`, stacked, a failed threads or checks query, an item waiting on the owner, review status unknown, a merge state that isn't `CLEAN` with no checks pending): report it and stop without merging.
+- **Only the owner can resolve it** (draft or `no-automerge`, stacked, a failed threads or checks query, an item waiting on the owner, review status unknown, a failed feedback query, a merge state that isn't `CLEAN` with no checks pending): report it and stop without merging.
 
 Merge only once every condition holds and no check is pending:
 ```bash

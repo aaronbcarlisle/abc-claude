@@ -8,6 +8,7 @@ allowed-tools:
   - Bash(npm:*)
   - Bash(npx tsc *)
   - Bash(pnpm:*)
+  - Bash(python -m unittest discover -s tests)
   - Bash(mkdir -p "$HOME/.claude/state/ship")
   - Bash(touch "$HOME/.claude/state/ship/*")
   - Skill
@@ -33,7 +34,7 @@ allowed-tools:
 - Run `git fetch origin` first, so every comparison with `origin/<default>` below sees the current remote branch.
 - Stop if the branch is the default branch, or `git rev-list --count origin/<default>..HEAD` is 0.
 - If the tree has uncommitted changes, ask (AskUserQuestion) whether they belong in this PR before going on.
-- If the PR for this branch is OPEN and not a draft, run step 2 (the gates), then `git push origin HEAD` so new local commits reach the PR, then go to step 6 with its number. Skip steps 3-5. If the push is rejected, report it and stop. If the PR is a draft, say so and stop: drafts opt out of auto-merge.
+- If the PR for this branch is OPEN and not a draft, run step 2 (the gates), then `git push origin HEAD` so new local commits reach the PR, then go to this skill's step 6 (Hand off) with its number. Skip steps 3-5. That's /ship's step 6, not pr-review-loop's Phase 6: the hand-off runs pr-review-loop's full loop, Phase 1 and the Phase 4 wait for reviewers and checks included, before any merge. If the push is rejected, report it and stop. If the PR is a draft, say so and stop: drafts opt out of auto-merge.
 
 ## 2. Gates
 Run the repo's gates with the same discovery as pr-review-loop Phase 2 step 4 (`package.json` scripts: lint → typecheck → test → build; `pyproject.toml` or `Makefile` commands; `tests/test_*.py` alone: `python -m unittest discover -s tests`; a repo test command in CLAUDE.md or AGENTS.md wins). All must pass. Gate commands outside this skill's allowed-tools go through the normal permission check. Run long gates with the Bash tool's `timeout: 600000` (up to 10 min), or in the background and wait for the notification. Remember the test command: pr-review-loop's Phase 6 passes the same command to the cleanup script, pre-approved there only as `python -m unittest discover -s tests`, `npm test` or `pnpm test` (for a repo with a root `package.json` whose test gate is its `test` script, pass `npm test` or `pnpm test`; a `package.json` only in a subfolder keeps the `npm --prefix <dir> test` form).

@@ -77,8 +77,20 @@ class PrCreatedTest(unittest.TestCase):
         self.assertIsNone(self.run_hook(stdout="error: no commits\n"))
 
     def test_silent_for_a_draft(self):
-        for flag in ("--draft", "-d", "--draft=true"):
+        for flag in ("--draft", "-d", "--draft=true", "--draft=1", "--draft=t", "--draft=T",
+                     "--draft=TRUE", "--draft=True", '"--draft"', "--draft='true'"):
             self.assertIsNone(self.run_hook(command="gh pr create %s --title T" % flag), flag)
+
+    def test_a_false_draft_value_is_not_a_draft(self):
+        # gh parses --draft=<v> with strconv.ParseBool, so these open a ready PR.
+        for flag in ("--draft=false", "--draft=0", "--draft=f", "--draft=F", "--draft=FALSE", "--draft=False"):
+            self.assertShip(self.run_hook(command="gh pr create %s --title T" % flag))
+
+    def test_a_quoted_separator_does_not_end_the_create_args(self):
+        for body in ('"&&"', "';'", '"a | b"', '"(x)"'):
+            self.assertIsNone(self.run_hook(command="gh pr create --body %s -d --title T" % body), body)
+            self.assertShip(self.run_hook(command="gh pr create --body %s --title T" % body))
+        self.assertShip(self.run_hook(command="gh pr create --title T; git branch -d old"))
 
     def test_draft_flag_of_another_command_is_not_a_draft(self):
         self.assertShip(self.run_hook(command="git branch -d old && gh pr create --title T --body B"))
