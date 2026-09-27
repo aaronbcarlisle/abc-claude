@@ -8,25 +8,26 @@ allowed-tools:
   - Bash(git:*)
   - Bash(npm:*)
   - Bash(npx:*)
+  - Bash(pnpm:*)
   - Bash(curl:*)
-  - Bash(sleep:*)
   - Bash(bash:*)
+  - Monitor
+  - TaskStop
   - Read
   - Edit
   - Write
   - Grep
   - Glob
-  - TodoWrite
 ---
 
 # PR Review Loop
 
 ## Context (preloaded; every line falls back instead of failing)
 - Current-branch PR: !`gh pr view --json number,url,headRefName,baseRefName,state,isDraft --jq '"#\(.number) \(.headRefName) -> \(.baseRefName) \(.state) draft=\(.isDraft) \(.url)"' 2>/dev/null || echo "NONE"`
-- My open PRs: !`gh pr list --author @me --state open --json number,headRefName,baseRefName --jq '.[] | "#\(.number) \(.headRefName) -> \(.baseRefName)"' 2>/dev/null || echo "none"`
+- My open PRs: !`gh pr list --author @me --state open --json number,headRefName,baseRefName --jq '.[] | "#\(.number) \(.headRefName) -> \(.baseRefName)"' 2>/dev/null | grep . || echo "none"`
 - Me: !`gh api user --jq .login 2>/dev/null || echo "unknown"`
 - Working tree: !`git status --short --branch 2>/dev/null || echo "not a git repo"`
-- Project manifests: !`git ls-files '*package.json' '*pyproject.toml' 'Makefile' '*/Makefile' 2>/dev/null | head -10 || echo "none"`
+- Project manifests: !`git ls-files '*package.json' '*pnpm-lock.yaml' '*pyproject.toml' 'Makefile' '*/Makefile' 2>/dev/null | head -20 | grep . || echo "none"`
 - Arguments: `$ARGUMENTS`
 
 ## Interpret the arguments
@@ -37,7 +38,7 @@ allowed-tools:
 If the working tree has unrelated uncommitted changes, ask before continuing.
 
 ## Goal
-Address ALL feedback until clean. "Low priority" ≠ optional. Every item is either **fixed** or **declined with a technical justification**. Track every item in TodoWrite as `[#PR source:id] summary`.
+Address ALL feedback until clean. "Low priority" ≠ optional. Every item is either **fixed** or **declined with a technical justification**. Track every item in the session's task list (TodoWrite or the Task tools, whichever this session has) as `[#PR source:id] summary`.
 
 | Level | Handling |
 |---|---|
@@ -55,9 +56,10 @@ A stack is a chain of PRs where each one's base is the previous one's head branc
 
 1. `git fetch origin` and map the stack bottom → top from the PR list.
 2. Check out the **top** branch and rebase the whole chain in one pass: `git rebase --update-refs origin/<bottom-base>`. This moves every intermediate branch too.
+   - **If the bottom PR was squash-merged**, its commits are not in `origin/<bottom-base>`, so a plain rebase replays them and conflicts. Cut them off instead: `git rebase --update-refs --onto origin/<bottom-base> <merged-tip>`, where `<merged-tip>` is the merged PR's last head commit (`gh pr view <N> --json headRefOid --jq .headRefOid`). Then point the next PR at the new base (`gh pr edit <next> --base <bottom-base>`) if GitHub didn't retarget it already.
 3. Resolve conflicts preserving both sides' intent. If a conflict is ambiguous, stop and ask.
 4. Run validation (Phase 2 step 4) on each branch.
-5. **Confirm with the user** before pushing, listing each branch and its old → new SHA. Then push each with `git push --force-with-lease origin <branch>`. Never plain `--force`.
+5. **Confirm with the user** before pushing, listing each branch and its old → new SHA, and any base change. Then push each with `git push --force-with-lease origin <branch>`. Never plain `--force`.
 6. Then run the loop below for every PR in the stack, bottom first. A fix in a lower PR needs another `--update-refs` rebase of the branches above it. That repeat rebase is covered by the original request, but still confirm before force-pushing.
 
 ---
@@ -67,20 +69,26 @@ A stack is a chain of PRs where each one's base is the previous one's head branc
 Run for each PR being worked on.
 
 ### 1.1 Review threads — GraphQL is the only source of truth
-Run the bundled script from this skill's base directory:
+Run the bundled script:
 ```bash
-bash <skill-base-dir>/scripts/threads.sh <PR>         # unresolved threads only
-bash <skill-base-dir>/scripts/threads.sh <PR> --all   # every thread, for the final check
+bash "${CLAUDE_SKILL_DIR}/scripts/threads.sh" <PR>         # unresolved threads only
+bash "${CLAUDE_SKILL_DIR}/scripts/threads.sh" <PR> --all   # every thread, for the final check
 ```
-It paginates automatically. Each thread returns: `thread` (id to resolve), `reply_to` (comment id to reply to), `last_by`, `on_commit`, `ask`, `last`.
+It paginates automatically. Each thread returns: `thread` (id to resolve), `reply_to` (comment id to reply to), `last_id`, `last_by`, `on_commit`, `ask`, `last`, `truncated`.
 
-Classify every unresolved thread into exactly one bucket:
+`ask` and `last` are cut to 400 and 300 characters. When `truncated` is true, read the full bodies before classifying, because suggestion blocks and the rest of a bot's reasoning come at the end:
+```bash
+gh api "repos/{owner}/{repo}/pulls/comments/<reply_to>" --jq .body   # opening comment
+gh api "repos/{owner}/{repo}/pulls/comments/<last_id>" --jq .body    # latest comment
+```
 
-| Condition | Action |
-|---|---|
-| `last_by` == me (fix SHA or decline already posted) | Missed resolve → verify, then resolve now |
-| `last_by` == reviewer | Open item → queue for Phase 2 |
-| Reviewer flags code that a later commit already fixed (`on_commit` predates the fix) | Race → reply with the fixing SHA and resolve; do not re-fix |
+Classify every unresolved thread into exactly one bucket. Check the rows in order; the first match wins:
+
+| # | Condition | Action |
+|---|---|---|
+| 1 | `last_by` == me (fix SHA or decline already posted) | Missed resolve → verify, then resolve now |
+| 2 | `last_by` == reviewer, but a later commit already changed the flagged code (`git log --oneline <on_commit>..HEAD -- <path>` shows it) | Race → verify the fix covers it, reply with the fixing SHA and resolve; do not re-fix |
+| 3 | `last_by` == reviewer | Open item → queue for Phase 2 |
 
 `outdated: true` only means nearby lines moved. It is **never** grounds to resolve. After a rebase, many threads go outdated. Check each one against the new code.
 
@@ -129,7 +137,7 @@ If TOTAL is 0 and CI is green for every PR, go to Phase 4.
 2. Fix it, or decline with a valid reason.
 3. Group related fixes into logical commits. Message format: `fix(review): <what> (addresses <reviewer> on <path>)`.
 4. **Validate locally before pushing.** Use the manifests from the context above:
-   - For each `package.json`, read its `scripts` and run what exists, fastest first: lint → typecheck → test → build. Use `npm --prefix <dir> run <script>`. If there is no typecheck script and a `tsconfig.json` exists there, run `npx tsc --noEmit -p <dir>`.
+   - For each `package.json`, read its `scripts` and run what exists, fastest first: lint → typecheck → test → build. Pick the package manager from the lockfile: if a `pnpm-lock.yaml` is listed in that directory or an ancestor (a workspace root), use `pnpm --dir <dir> run <script>`, otherwise `npm --prefix <dir> run <script>`. If there is no typecheck script and a `tsconfig.json` exists there, run `pnpm --dir <dir> exec tsc --noEmit` or `npx tsc --noEmit -p <dir>` to match.
    - For `pyproject.toml` or `Makefile` projects, read them to find the lint and test commands. If a needed tool is not pre-approved, request it once.
    - If there are no manifests, say so and rely on CI.
    - Never push failing validation.
@@ -142,9 +150,9 @@ If TOTAL is 0 and CI is green for every PR, go to Phase 4.
 
 ```bash
 git push origin HEAD
-gh pr checks <PR> --watch --interval 30   # use a long Bash timeout; re-run if it times out
+gh pr checks <PR> --watch --interval 30   # Bash with run_in_background: one notification when CI finishes
 ```
-Verify all checks pass. If Vercel is in use, confirm the preview returns 200: `curl -s -o /dev/null -w '%{http_code}\n' <preview-url>`.
+Verify all checks pass. Foreground `sleep` is blocked, so never wait on CI with a sleep loop. If Vercel is in use, confirm the preview returns 200: `curl -s -o /dev/null -w '%{http_code}\n' <preview-url>`.
 
 ### Thread protocol: reply → verify → resolve, always in that order
 1. **Reply** to every thread you handled:
@@ -164,9 +172,22 @@ Verify all checks pass. If Vercel is in use, confirm the preview returns 200: `c
 ## Phase 4 — Monitor loop
 
 One iteration is one push cycle. After each push:
-1. Wait for CI (`gh pr checks --watch`).
-2. Wait for bot re-reviews. Poll every 60s (`sleep 60`) for up to 5 minutes, looking for reviews or comments newer than the push, or edited bot summaries.
-3. If new feedback appears, return to Phase 1.
+1. Wait for CI (the background `gh pr checks --watch` from Phase 3).
+2. Wait for bot re-reviews with the **Monitor** tool (`timeout_ms: 360000`). This command polls every 30s for 5 minutes and prints one line per new or edited review, inline comment or PR comment since the push commit, then exits:
+   ```bash
+   since=$(TZ=UTC git log -1 --date=format-local:%Y-%m-%dT%H:%M:%SZ --format=%cd)
+   for i in 1 2 3 4 5 6 7 8 9 10; do
+     gh api "repos/{owner}/{repo}/pulls/<PR>/reviews" --jq ".[] | select(.submitted_at > \"$since\" and .user.login != \"<me>\") | \"review \(.id) by \(.user.login)\"" || true
+     gh api "repos/{owner}/{repo}/pulls/<PR>/comments?since=$since" --jq ".[] | select(.user.login != \"<me>\") | \"inline \(.id) by \(.user.login) at \(.updated_at)\"" || true
+     gh api "repos/{owner}/{repo}/issues/<PR>/comments?since=$since" --jq ".[] | select(.user.login != \"<me>\") | \"comment \(.id) by \(.user.login) at \(.updated_at)\"" || true
+     sleep 30
+   done | while IFS= read -r ev; do   # print each event once
+     case "$seen" in *"|$ev|"*) ;; *) seen="$seen|$ev|"; echo "$ev" ;; esac
+   done
+   echo "quiet window over"
+   ```
+   The `?since=` filter matches on update time, so a bot editing its summary in place shows up as a new line.
+3. If new feedback appears, stop the monitor with TaskStop and return to Phase 1. Phase 1 re-reads everything, so anything that lands later is caught on the next iteration.
 
 Exit when any of these is true:
 - **Clean:** the sweep shows 0 open threads on every PR, CI is green, and no new feedback arrived during the quiet window.
