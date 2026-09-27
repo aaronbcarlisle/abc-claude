@@ -43,6 +43,34 @@
             "timeout": 10
           }
         ]
+      },
+      {
+        "matcher": "Bash|PowerShell",
+        "hooks": [
+          {
+            "type": "command",
+            "if": "Bash(gh pr create *)",
+            "command": "python \"$HOME/.claude/hooks/pr_created.py\"",
+            "timeout": 10
+          },
+          {
+            "type": "command",
+            "if": "PowerShell(gh pr create *)",
+            "command": "python \"$HOME/.claude/hooks/pr_created.py\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python \"$HOME/.claude/hooks/stop_guard.py\"",
+            "timeout": 10
+          }
+        ]
       }
     ]
   },

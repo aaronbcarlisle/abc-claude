@@ -103,7 +103,7 @@ Tests (`tests/test_post_merge_cleanup.py`) run against temp repos with a bare or
   - the command has `--draft` or `-d`;
   - the input has `agent_id` (a subagent);
   - `CLAUDE_SHIP_DISABLE=1` is set;
-  - the session is already inside `/ship`, detected by a marker file `~/.claude/state/ship/<session_id>` that `/ship` writes and removes.
+  - the session is already inside `/ship`, detected by a marker file `~/.claude/state/ship/<session_id>` that `/ship` writes. The hook deletes that marker when it sees the created PR, and `/ship` removes it itself only after a failed push, body or `gh pr create`.
 - Otherwise it emits `additionalContext`: "PR #N opened (<url>). Continue in this turn: invoke the pr-review-loop skill with `ship #N`."
 - Never blocks, and is silent on any error.
 
