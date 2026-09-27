@@ -7,12 +7,10 @@ allowed-tools:
   - Bash(gh:*)
   - Bash(git:*)
   - Bash(npm:*)
-  - Bash(npx:*)
+  - Bash(npx tsc *)
   - Bash(pnpm:*)
-  - Bash(curl:*)
-  - Bash(bash:*)
-  - Bash(python:*)
-  - Bash(POST_MERGE_TEST_TIMEOUT=540 python *)
+  - Bash(bash "${CLAUDE_SKILL_DIR}/scripts/threads.sh" *)
+  - Bash(POST_MERGE_TEST_TIMEOUT=540 python "$HOME/.claude/scripts/post_merge_cleanup.py" *)
   - Monitor
   - TaskStop
   - TodoWrite
@@ -39,7 +37,7 @@ allowed-tools:
 
 ## Interpret the arguments
 - `ship` anywhere in the arguments enables Phase 6: once the loop exits clean, merge and clean up.
-- A second `ship #N` for a PR this session's loop is already running on is a duplicate: ignore it and carry on with the running loop. That happens when the pr_created hook's note arrives after /ship's own hand-off.
+- Inside /ship, the pr_created hook's note arrives right after `gh pr create`, before /ship's own hand-off: finish /ship's remaining steps (clearing its marker) first, then hand off once. A second `ship #N` for a PR this session's loop is already running on is a duplicate: ignore it and carry on with the running loop.
 - A bare integer is max iterations (default 25).
 - `#N` tokens are the PRs to work on. If none are given, use the current-branch PR. If that is `NONE`, stop and tell the user there is no PR for this branch.
 - Anything else is an extra instruction from the user (e.g. "rebase the stack"). Do it before Phase 1 and follow the rules below.
@@ -83,7 +81,7 @@ Run the bundled script:
 bash "${CLAUDE_SKILL_DIR}/scripts/threads.sh" <PR>         # unresolved threads only
 bash "${CLAUDE_SKILL_DIR}/scripts/threads.sh" <PR> --all   # every thread, for the final check
 ```
-It paginates automatically. Each thread returns: `thread` (id to resolve), `reply_to` (comment id to reply to), `last_id`, `last_by`, `on_commit`, `ask`, `last`, `truncated`.
+Run it in exactly this form: the allowed-tools rule pre-approves `bash "${CLAUDE_SKILL_DIR}/scripts/threads.sh" …` and no other `bash` command. It paginates automatically. Each thread returns: `thread` (id to resolve), `reply_to` (comment id to reply to), `last_id`, `last_by`, `on_commit`, `ask`, `last`, `truncated`.
 
 `ask` and `last` are cut to 400 and 300 characters. When `truncated` is true, read the full bodies before classifying, because suggestion blocks and the rest of a bot's reasoning come at the end:
 ```bash
@@ -148,7 +146,8 @@ If TOTAL is 0 and CI is green for every PR, go to Phase 4. With `ship`, TOTAL 0 
 4. **Validate locally before pushing.** Use the manifests from the context above:
    - For each `package.json`, read its `scripts` and run what exists, fastest first: lint → typecheck → test → build. Pick the package manager from the lockfile: if a `pnpm-lock.yaml` is listed in that directory or an ancestor (a workspace root), use `pnpm --dir <dir> run <script>`, otherwise `npm --prefix <dir> run <script>`. If there is no typecheck script and a `tsconfig.json` exists there, run `pnpm --dir <dir> exec tsc --noEmit` or `npx tsc --noEmit -p <dir>` to match.
    - For `pyproject.toml` or `Makefile` projects, read them to find the lint and test commands. If a needed tool is not pre-approved, request it once.
-   - If there are no manifests, say so and rely on CI.
+   - No `package.json`, `pyproject.toml` or `Makefile`, but `tests/test_*.py` files: the test command is `python -m unittest discover -s tests`. It isn't pre-approved: it goes through the normal permission check.
+   - If none of these applies, say so and rely on CI.
    - Never push failing validation.
 5. **Fix rounds get the gates only.** No local `/code-review` and no re-requested bot review for fix commits. One exception: record the PR head SHA when the loop starts. If this PR's fix commits change 50 or more lines outside tests and docs, and the repo has `.github/workflows/claude-code-review.yml`, post `@claude review` as a PR comment, once per PR. Count the lines as the insertions plus deletions this prints:
    `git diff --shortstat <start-sha>..HEAD -- . ':(exclude)*test*' ':(exclude)*.md' ':(exclude)docs/**'`
@@ -163,7 +162,7 @@ If TOTAL is 0 and CI is green for every PR, go to Phase 4. With `ship`, TOTAL 0 
 git push origin HEAD
 gh pr checks <PR> --watch --interval 30   # Bash with run_in_background: one notification when CI finishes
 ```
-Verify all checks pass. Foreground `sleep` is blocked, so never wait on CI with a sleep loop. If Vercel is in use, confirm the preview returns 200: `curl -s -o /dev/null -w '%{http_code}\n' <preview-url>`.
+Verify all checks pass. Foreground `sleep` is blocked, so never wait on CI with a sleep loop. If Vercel is in use, confirm the preview returns 200: `curl -s -o /dev/null -w '%{http_code}\n' <preview-url>` (`curl` isn't pre-approved: it goes through the normal permission check).
 
 ### Thread protocol: reply → verify → resolve, always in that order
 1. **Reply** to every thread you handled:
@@ -176,7 +175,7 @@ Verify all checks pass. Foreground `sleep` is blocked, so never wait on CI with 
    gh api graphql -f query='mutation($id:ID!){resolveReviewThread(input:{threadId:$id}){thread{isResolved}}}' -F id=<thread>
    ```
 3. **PR-level and summary items** have no threads to resolve. Post one comment listing each item with its fix SHA or decline reason.
-4. **Sweep** before ending every iteration (safe to re-run): run `threads.sh <PR>` again. Every remaining thread must have `last_by` == reviewer and be queued. If `last_by` is you, the thread was replied to but not resolved, so resolve it now.
+4. **Sweep** before ending every iteration (safe to re-run): run `bash "${CLAUDE_SKILL_DIR}/scripts/threads.sh" <PR>` again. Every remaining thread must have `last_by` == reviewer and be queued. If `last_by` is you, the thread was replied to but not resolved, so resolve it now.
 
 ---
 
@@ -260,27 +259,43 @@ gh repo view --json defaultBranchRef --jq .defaultBranchRef.name
 gh pr checks <PR> --json name,bucket --jq '[.[] | select(.bucket != "pass" and .bucket != "skipping")] | length'
 bash "${CLAUDE_SKILL_DIR}/scripts/threads.sh" <PR>
 ```
-Merge only when all of these hold:
-- the PR isn't a draft and has no `no-automerge` label. Otherwise report "auto-merge off: <draft | no-automerge>" and stop.
-- its base is the default branch. Otherwise report "stacked: run /finalize-stack" and stop.
+All of these must hold:
+- the PR isn't a draft and has no `no-automerge` label. Otherwise report "auto-merge off: <draft | no-automerge>".
+- its base is the default branch. Otherwise report "stacked: run /finalize-stack".
 - `head` equals `git rev-parse HEAD` (nothing landed since the last check);
 - the checks query prints `0`;
-- `threads.sh` prints nothing;
+- `threads.sh` exits 0 and prints nothing. A non-zero exit is a failed query, not "no threads": run it once more, and if it fails again report "blocked: review threads query failed".
 - no item in this loop's task list is waiting on the owner;
-- the last Phase 4 wait didn't print `review status unknown`. Otherwise report "blocked: review status unknown (gh query failed)" and stop.
-- `mergeStateStatus` is `CLEAN`. On `UNKNOWN`, re-query up to 3 times, 30 s apart. Any other state (`BLOCKED`, `BEHIND`, `DIRTY`, `UNSTABLE`): report it and stop.
+- the last Phase 4 wait didn't print `review status unknown`. Otherwise report "blocked: review status unknown (gh query failed)".
+- `mergeStateStatus` is `CLEAN`. On `UNKNOWN`, re-query with the **Monitor** tool, never a foreground `sleep` (`timeout_ms: 180000`; it prints the state every 30 s, up to 3 times, and exits once it isn't `UNKNOWN`):
+  ```bash
+  for i in 1 2 3; do sleep 30; s=$(gh pr view <PR> --json mergeStateStatus --jq .mergeStateStatus); echo "$s"; [ "$s" != UNKNOWN ] && break; done
+  ```
+  Still `UNKNOWN` after that, or `BLOCKED`, `BEHIND`, `DIRTY` or `UNSTABLE` with no checks pending: report the state.
 
-If the checks query counts only pending checks, wait on that background watch and re-check everything. A failing check goes back to Phase 1. `UNSTABLE` or `BLOCKED` while checks are pending counts as pending, not a stop. To tell pending from failing, drop `| length` from the checks query: it then lists each check's `bucket` (`pending`, `fail` or `cancel`).
+To tell pending checks from failing ones, drop `| length` from the checks query: it then lists each check's `bucket` (`pending`, `fail` or `cancel`). If only pending checks keep the count above `0`, wait for CI. If no `gh pr checks <PR> --watch` is running in the background, start `gh pr checks <PR> --watch --interval 30` with Bash `run_in_background`; wait for its notification, then re-check everything. `UNSTABLE` or `BLOCKED` while checks are pending counts as pending, not a stop.
 
-If a condition fails for a reason only the owner can resolve, report it and stop without merging. Then:
+If a condition fails otherwise:
+- **The loop can fix it** (`head` moved, new unresolved threads, a failing check): go back to Phase 1.
+- **Only the owner can resolve it** (draft or `no-automerge`, stacked, a failed threads query, an item waiting on the owner, review status unknown, a merge state that isn't `CLEAN` with no checks pending): report it and stop without merging.
+
+Merge only once every condition holds and no check is pending:
 ```bash
 gh pr merge --squash <PR>          # this argument order matches the permission allow rule
+```
+If the merge exits non-zero, report its error and stop: don't query the merge SHA, don't run the cleanup, and write no handoff line. Otherwise read the merge SHA:
+```bash
 gh pr view <PR> --json mergeCommit --jq .mergeCommit.oid
+```
+If it prints nothing or `null`, the merge isn't confirmed: report that and stop the same way.
+
+Then run the cleanup. Run it from this session's checkout: `--repo .` and `--here` both follow the current directory, and the handoff line goes to that checkout's SESSION_HANDOFF.md, when it has one.
+```bash
 POST_MERGE_TEST_TIMEOUT=540 python "$HOME/.claude/scripts/post_merge_cleanup.py" --repo . --here --test '<gate test command>'
 ```
 Run the cleanup with the Bash tool's `timeout: 600000`. If it still moves to the background, wait for its completion notification; never start a second run.
 
-`<gate test command>` is the test command from Phase 2 step 4's discovery (the same one /ship's gates used; a test command in CLAUDE.md or AGENTS.md wins). Pass it single-quoted in Bash. Inside it use double quotes only, because on Windows the script runs it through cmd.exe: no `$VAR`, `'…'`, `~` or `2>/dev/null`. Don't wrap it in `bash -c` and don't switch shells. Omit `--test` when the repo has no test command.
+`<gate test command>` is the test command from Phase 2 step 4's discovery (the same one /ship's gates used; a test command in CLAUDE.md or AGENTS.md wins). Pass it single-quoted in Bash. Inside it use double quotes only, because on Windows the script runs it through cmd.exe: no `$VAR`, `'…'`, `~` or `2>/dev/null`. Don't wrap it in `bash -c` and don't switch shells. For a repo whose only tests are `tests/test_*.py`, that's `--test 'python -m unittest discover -s tests'`, which is already safe. Omit `--test` when the repo has no test command.
 
 Reading the cleanup's exit code and output:
 - Report the merge SHA and the cleanup output.
@@ -288,7 +303,6 @@ Reading the cleanup's exit code and output:
 - Exit 2: either `post-merge cleanup refused: <reason>` (nothing changed) or `post-merge cleanup failed: <error>` followed by what was already deleted or kept. Report the line as printed.
 - Exit 0 with `tests: skipped` isn't a failure. Report the `note:` that says why: a live session or uncommitted changes in the main checkout, main not on the default branch, or pull failed. Without `--test` there is no note: the tests are always skipped.
 - A kept branch `checked out in this session's worktree` is expected; tell the owner to remove that worktree after the session ends.
-- Run it from this session's checkout: `--repo .` and `--here` both follow the current directory, and the handoff line goes to that checkout's SESSION_HANDOFF.md, when it has one.
 
 ---
 
