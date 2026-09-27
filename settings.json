@@ -1,0 +1,60 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(gh pr create *)",
+      "Bash(gh pr merge --squash *)"
+    ],
+    "defaultMode": "auto"
+  },
+  "model": "opus",
+  "skillOverrides": {
+    "anthropic-skills:docx": "off",
+    "anthropic-skills:pptx": "off",
+    "anthropic-skills:xlsx": "off",
+    "anthropic-skills:morning": "off",
+    "anthropic-skills:import-memory": "off",
+    "cleanup": "off",
+    "doc-audit": "off",
+    "anthropic-skills:docs": "off",
+    "anthropic-skills:pdf": "off"
+  },
+  "hooks": {
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python \"$HOME/.claude/hooks/context_budget.py\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  },
+  "statusLine": {
+    "type": "command",
+    "command": "python \"$HOME/.claude/status_line.py\"",
+    "refreshInterval": 60
+  },
+  "enabledPlugins": {
+    "superpowers@claude-plugins-official": true,
+    "chrome-devtools-mcp@claude-plugins-official": true
+  },
+  "modelSettings": {
+    "claude-opus-5": {
+      "effortLevel": "high"
+    },
+    "claude-fable-5-1": {},
+    "claude-opus-5-5": {
+      "effortLevel": "xhigh"
+    }
+  },
+  "fastModePerSessionOptIn": true,
+  "autoUpdatesChannel": "latest",
+  "tui": "fullscreen",
+  "skipDangerousModePermissionPrompt": true,
+  "remoteControlAtStartup": false,
+  "inputNeededNotifEnabled": true,
+  "agentPushNotifEnabled": true,
+  "voiceEnabled": true
+}
