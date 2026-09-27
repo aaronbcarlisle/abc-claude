@@ -16,4 +16,5 @@
 - After a restart, resume, compaction or usage-limit pause, confirm that dispatched subagents and background jobs are still running (task list, process or log) before reporting progress or waiting on them. Re-dispatch anything that died.
 - For implementation subagents, use the repo's own implementer agent if it has one; otherwise `implementer`.
 - One session per checkout. Parallel work in the same repo goes in its own worktree, never the checkout another session is using.
+- After loading a skill, keep executing it in the same turn; never reply "No response requested".
 - Resume with `/resume`. In multi-task runs, `/handoff log` after each task passes review; `/handoff` before the session ends or when usage or context runs low.
