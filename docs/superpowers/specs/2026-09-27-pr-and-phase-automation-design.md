@@ -1,6 +1,6 @@
 # PR and phase automation: design
 
-Date: 2026-09-27. Repo: abc-claude (`~/.claude`). Status: awaiting owner review.
+Date: 2026-09-27. Repo: abc-claude (`~/.claude`). Status: approved by the owner on 2026-09-27.
 
 ## Goal
 
