@@ -243,6 +243,17 @@ class AttributionGuardTest(unittest.TestCase):
     def test_trailer_flag_blocks(self):
         self.assertBlocked('git commit -m "subject" --trailer "Co-authored-by: Claude <noreply@anthropic.com>"')
 
+    def test_trailer_flag_key_equals_value_form_blocks(self):
+        self.assertBlocked('git commit -m "subject" --trailer "Co-authored-by=Claude <noreply@anthropic.com>"')
+
+    def test_short_option_clusters_carry_the_message(self):
+        trailer = "Co-Authored-By: Claude <noreply@anthropic.com>"
+        self.assertBlocked(f'git commit -am "x\n\n{trailer}"')
+        self.assertBlocked(f'git commit -sam"x\n\n{trailer}"')
+        self.write("msg.txt", f"Fix bug\n\n{trailer}\n")
+        self.assertBlocked("git commit -aF msg.txt")
+        self.assertAllowed('git commit -am "fix the thing"')
+
     def test_gh_pr_create_body_file_generated_with_blocks(self):
         self.write("body.md", "Adds the thing.\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n")
         self.assertBlocked('gh pr create --title "t" --body-file body.md')

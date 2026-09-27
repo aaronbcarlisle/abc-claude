@@ -17,7 +17,8 @@ Enforces two global rules from CLAUDE.md that prose alone didn't hold:
      PowerShell here-string written with Set-Content, Add-Content, Out-File or
      a redirect. Heredocs that feed a program (`python - <<'EOF'`) stay allowed.
   3. Never add AI attribution to a commit message or PR/issue text. Blocks a
-     `git commit`/`git merge` `-m`/`-F`/`--trailer` (and long forms) and a
+     `git commit`/`git merge` `-m`/`-F`/`--trailer` (long forms and short
+     clusters like `-am` too) and a
      `gh pr|issue|release create|edit|comment|review|merge` `-b`/`--body`-style
      option, and a `gh api` `-f`/`-F`/`--field`/`--raw-field`/`--input`, whose
      text carries a Co-Authored-By trailer naming Claude or Anthropic, a
@@ -96,15 +97,20 @@ ATTRIBUTION_MESSAGE = (
 # link, anywhere case-insensitive. The first two are anchored to a line start
 # (`re.MULTILINE`) so prose mentioning Claude mid-sentence never matches.
 ATTRIBUTION_PATTERNS = [
-    re.compile(r"(?im)^[ \t]*co-authored-by:[^\n]*\b(claude|anthropic)\b"),
-    re.compile(r"(?im)^[ \t]*co-authored-by:[^\n]*noreply@anthropic\.com"),
-    re.compile(r"(?im)^[ \t]*claude-session:"),
+    # `[:=]`: `git commit --trailer` also takes the `key=value` form.
+    re.compile(r"(?im)^[ \t]*co-authored-by[:=][^\n]*\b(claude|anthropic)\b"),
+    re.compile(r"(?im)^[ \t]*co-authored-by[:=][^\n]*noreply@anthropic\.com"),
+    re.compile(r"(?im)^[ \t]*claude-session[:=]"),
     re.compile(r"(?i)generated (with|by) \[?claude code"),
     re.compile(r"(?i)claude\.ai/code/session_"),
 ]
 # git commit/merge options that carry message text: {name: "value" | "file"}.
 GIT_MESSAGE_OPTS = {"-m": "value", "--message": "value", "-F": "file", "--file": "file",
                     "--trailer": "value"}
+# Short options that take a value, per subcommand: in a cluster (`-am msg`), the
+# rest of the word after one of these is its value, so splitting stops there.
+# (`-s` is --signoff for commit but --strategy for merge.)
+GIT_SHORT_WITH_VALUE = {"commit": set("mFCctSu"), "merge": set("mFsXS")}
 GH_BODY_OPTS = {"-b": "value", "--body": "value", "-F": "file", "--body-file": "file"}
 GH_SUBJECT_OPTS = {"-t": "value", "--subject": "value"}
 GH_NOTES_OPTS = {"-n": "value", "--notes": "value", "-F": "file", "--notes-file": "file"}
@@ -519,6 +525,24 @@ def git_subcommand(cwd, toks):
     return None
 
 
+def split_git_clusters(args, with_value):
+    """`args` with short-option clusters split so `-am msg` reads as `-a -m msg`
+    and `-sam"msg"` as `-s -a -m"msg"`. A cluster ends at the first letter in
+    `with_value`; `-Cmain` stays `-C` with value `main`."""
+    out = []
+    for a in args:
+        if len(a) > 2 and a[0] == "-" and a[1] != "-" and a[1].isalpha() and a[1] not in with_value:
+            k = 1
+            while k < len(a) and a[k].isalpha() and a[k] not in with_value:
+                out.append("-" + a[k])
+                k += 1
+            if k < len(a):
+                out.append("-" + a[k:])
+            continue
+        out.append(a)
+    return out
+
+
 def gh_attribution_hit(cwd, seg):
     """(where, matched line) if a `gh` call in `seg` carries AI attribution, else None."""
     if len(seg) < 2:
@@ -557,6 +581,7 @@ def attribution_hit(cwd, seg):
         if call:
             sub_cwd, sub, args = call
             if sub in ("commit", "merge"):
+                args = split_git_clusters(args, GIT_SHORT_WITH_VALUE[sub])
                 for text in scan_options(sub_cwd, args, GIT_MESSAGE_OPTS):
                     line = attribution_match(text)
                     if line:
