@@ -4,8 +4,8 @@ PR-created hook (PostToolUse; `if: Bash(gh pr create *)` and `PowerShell(gh pr c
 
 After a session opens a non-draft PR, tells Claude to carry straight on into
 the ship loop: pr-review-loop with `ship #N`, which reviews, fixes and merges
-it. Silent when:
-- there's no PR URL in the tool output;
+it. The PR is the first PR URL on the command's stdout. Silent when:
+- there's no PR URL there;
 - the command asked for a draft (`--draft`, `--draft=...` or `-d`);
 - it runs inside a subagent (`agent_id`);
 - CLAUDE_SHIP_DISABLE=1 is set;
@@ -44,6 +44,15 @@ def is_draft(command):
     return any(w in ("--draft", "-d") or w.startswith("--draft=") for w in words)
 
 
+def output(response):
+    """The command's stdout, where `gh pr create` prints the new PR's URL (the whole response when
+    it has no stdout field). The first URL in it is the created PR's: a later one comes from another
+    command in the same call, and an "already exists" URL goes to stderr."""
+    if isinstance(response, dict) and isinstance(response.get("stdout"), str):
+        return response["stdout"]
+    return response if isinstance(response, str) else json.dumps(response)
+
+
 def in_ship(session):
     if not SESSION_ID.match(session):
         return False
@@ -60,15 +69,14 @@ def main():
     command = (data.get("tool_input") or {}).get("command") or ""
     if not GH_PR_CREATE.search(command) or is_draft(command):
         return
-    urls = list(PR_URL.finditer(json.dumps(data.get("tool_response"))))
-    if not urls:
+    url = PR_URL.search(output(data.get("tool_response")))
+    if not url:
         return
     if in_ship(data.get("session_id") or ""):
         return
-    last = urls[-1]
     print(json.dumps({"hookSpecificOutput": {
         "hookEventName": "PostToolUse",
-        "additionalContext": MESSAGE.format(n=last.group(1), url=last.group(0)),
+        "additionalContext": MESSAGE.format(n=url.group(1), url=url.group(0)),
     }}))
     sys.stdout.flush()
 

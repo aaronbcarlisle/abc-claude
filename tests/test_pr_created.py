@@ -57,9 +57,21 @@ class PrCreatedTest(unittest.TestCase):
         payload_out = self.run_hook(stdout=None, tool_response=URL)  # response given as a bare string
         self.assertShip(payload_out)
 
-    def test_last_url_wins(self):
-        out = self.run_hook(stdout="see https://github.com/o/r/pull/7\nhttps://github.com/o/r/pull/8\n")
+    def test_first_url_wins(self):
+        # gh pr create prints the new PR's URL; a later URL comes from something else in the command.
+        out = self.run_hook(stdout="https://github.com/o/r/pull/8\nsee https://github.com/o/r/pull/7\n")
         self.assertShip(out, "8")
+
+    def test_a_later_command_does_not_redirect_the_hand_off(self):
+        out = self.run_hook(command="gh pr create --title T --body B; gh pr view 7 --json url",
+                            stdout='https://github.com/o/r/pull/8\n{"url":"https://github.com/o/r/pull/7"}\n')
+        self.assertShip(out, "8")
+
+    def test_a_url_only_on_stderr_is_not_a_created_pr(self):
+        # "a pull request for branch ... already exists: <url>" goes to stderr; nothing was created.
+        self.assertIsNone(self.run_hook(stdout="", tool_response={
+            "stdout": "", "stderr": "a pull request already exists:\nhttps://github.com/o/r/pull/9\n",
+            "interrupted": False}))
 
     def test_silent_without_a_url(self):
         self.assertIsNone(self.run_hook(stdout="error: no commits\n"))
