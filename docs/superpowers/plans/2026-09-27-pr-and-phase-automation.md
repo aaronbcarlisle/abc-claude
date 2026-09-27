@@ -2317,6 +2317,16 @@ class FinalizeStackTest(unittest.TestCase):
         self.assertIn("git rebase --update-refs", text)
         self.assertIn("gh pr merge --squash <N>", text)
         self.assertIn("post_merge_cleanup.py", text)
+
+    def test_reuses_a_checkout_that_already_holds_a_stack_branch(self):
+        # `git worktree add <path> <branch>` fails when <branch> is checked out anywhere, e.g. when
+        # the top branch is the current branch of the checkout /finalize-stack runs from.
+        text = body(skill("finalize-stack"))
+        self.assertIn("git worktree list --porcelain", text)
+        self.assertIn("the top branch is this checkout's current branch", text)
+        self.assertIn("git -C <path> status --porcelain --untracked-files=no", text)
+        self.assertIn("with uncommitted changes; commit or stash them there", text)
+        self.assertIn("In every PR's checkout except the top PR's, run `git switch --detach`", text)
 ```
 
 - [ ] **Step 2: Run it to watch it fail.** Run `python -m unittest tests.test_skill_files.FinalizeStackTest -v`. Expected: `FileNotFoundError` for `skills/finalize-stack/SKILL.md`.
@@ -2370,12 +2380,15 @@ STACK (bottom → top)
 
 ## 2. Triage in parallel
 1. `git fetch origin`. The working tree must be clean; if it isn't, stop and ask.
-2. For each PR, run `git worktree add <root>-s<N> <head-branch>`. The worktree is a sibling of the repo root at a short path, which avoids long-path failures. If the path exists, reuse it only when it's a clean worktree on that branch; otherwise stop and ask.
+2. Give each PR exactly one checkout: git refuses to check a branch out twice, so `git worktree add` fails for a branch that's already checked out, here or in another worktree. Run `git worktree list --porcelain`; each `worktree <path>` record lists its `branch refs/heads/<name>`. Then, for each PR:
+   - **Its head branch is already checked out** (for example, the top branch is this checkout's current branch): use that checkout; don't add a worktree. It must be clean: `git -C <path> status --porcelain --untracked-files=no` prints nothing. Otherwise stop with "`<head>` is checked out in `<path>` with uncommitted changes; commit or stash them there, then re-run /finalize-stack". If it isn't this checkout and `python "$HOME/.claude/scripts/live_sessions.py" <path>` exits 1, stop with "another session is working in `<path>`".
+   - **Otherwise:** `git worktree add <root>-s<N> <head-branch>`. The worktree is a sibling of the repo root at a short path, which avoids long-path failures. If the path exists, reuse it only when it's a clean worktree on that branch; otherwise stop and ask.
+   Record each PR's checkout. "Its checkout" below means that path.
 3. In one message, dispatch one agent per PR, in parallel. Use the repo's own implementer agent if it has one, otherwise `implementer`. Fill in this prompt:
    ```
-   Triage review feedback for PR #<N> (<head> -> <base>). Work only in <worktree path>.
+   Triage review feedback for PR #<N> (<head> -> <base>). Work only in <its checkout>.
    1. Read ~/.claude/skills/pr-review-loop/SKILL.md sections 1.1-1.4 and run them for PR #<N>
-      (threads: `bash ~/.claude/skills/pr-review-loop/scripts/threads.sh <N>`, run from the worktree).
+      (threads: `bash ~/.claude/skills/pr-review-loop/scripts/threads.sh <N>`, run from that checkout).
    2. Classify every item: fix; decline (only with a valid reason from that skill's Guardrails);
       or needs-owner (architecture, breaking API, ambiguous feedback, taste calls).
    3. Apply the fixes. Run the gates: <gate commands>. Commit each logical fix with the message in a
@@ -2387,14 +2400,14 @@ STACK (bottom → top)
    ```
 
 ## 3. Owner rulings
-Collect every `needs_owner` item across the stack and ask them in one batch: AskUserQuestion allows up to 4 questions per call, so for more, make consecutive calls with nothing in between. Apply each ruling in its PR's worktree, run the gates and commit.
+Collect every `needs_owner` item across the stack and ask them in one batch: AskUserQuestion allows up to 4 questions per call, so for more, make consecutive calls with nothing in between. Apply each ruling in its PR's checkout, run the gates and commit.
 
 ## 4. Restack
-1. `git rebase --update-refs` won't move a branch that's checked out in another worktree. In each worktree except the top one, run `git switch --detach` first.
-2. In the top PR's worktree: `git rebase --update-refs origin/<default>`.
+1. `git rebase --update-refs` won't move a branch that's checked out in another worktree. In every PR's checkout except the top PR's, run `git switch --detach` first. This includes this checkout when it holds a lower branch; when it holds the top branch, it's the top PR's checkout and stays attached.
+2. In the top PR's checkout: `git rebase --update-refs origin/<default>`.
    - If the bottom PR was already squash-merged, cut its commits off instead: `git rebase --update-refs --onto origin/<default> <merged head SHA> <top-branch>`.
    - Resolve conflicts, preserving both sides' intent. An ambiguous conflict means stop and ask.
-3. In each other worktree, `git switch <its branch>`, then run the gates there.
+3. In each other PR's checkout, `git switch <its branch>`, then run the gates there.
 4. Push each branch with `git push --force-with-lease origin <branch>` and note old → new SHA.
 5. For each PR, once its checks register, run `gh pr checks <N> --watch --interval 30` (Bash, `run_in_background`).
 6. After CI is green, follow pr-review-loop's thread protocol:
@@ -2406,7 +2419,7 @@ Collect every `needs_owner` item across the stack and ask them in one batch: Ask
 For the bottom PR, whose base is the default branch:
 1. Check: the checks query prints 0 (`gh pr checks <N> --json bucket --jq '[.[] | select(.bucket != "pass" and .bucket != "skipping")] | length'`); `threads.sh <N>` prints nothing; `mergeStateStatus` is `CLEAN` (on `UNKNOWN`, re-query 3 times, 30 s apart).
 2. Note its head SHA (`gh pr view <N> --json headRefOid --jq .headRefOid`), then run `gh pr merge --squash <N>`.
-3. `git fetch origin`. Detach every remaining worktree except the top one. In the top worktree, run `git rebase --update-refs --onto origin/<default> <merged head SHA> <top-branch>`. Re-attach, run the gates, and push each remaining branch with `--force-with-lease`.
+3. `git fetch origin`. Detach every remaining PR's checkout except the top PR's. In the top PR's checkout, run `git rebase --update-refs --onto origin/<default> <merged head SHA> <top-branch>`. Re-attach, run the gates, and push each remaining branch with `--force-with-lease`.
 4. `gh pr view <next> --json baseRefName --jq .baseRefName`. GitHub retargets the next PR when the merged branch is deleted; if it didn't, run `gh pr edit <next> --base <default>`.
 5. Wait for green CI on the next PR. Don't wait for bot re-reviews: fix commits get the gates only. Repeat from step 1 until the stack is merged.
 
@@ -2415,7 +2428,7 @@ Stop and ask when a conflict is ambiguous, or when CI still fails on a branch af
 ## 6. Cleanup
 From the repo root:
 `python "$HOME/.claude/scripts/post_merge_cleanup.py" --repo <root> --here --test "<gate test command>"`
-It removes the clean `-s<N>` worktrees and deletes the merged branches. If `SESSION_HANDOFF.md` exists, run `/handoff log`.
+It removes the clean `-s<N>` worktrees and deletes the merged branches. A merged branch still checked out in this checkout is handled as the script's `--here` rules say. If `SESSION_HANDOFF.md` exists, run `/handoff log`.
 
 ## Report
 ```
@@ -2435,7 +2448,7 @@ Stopped at:    [none | #N — why]
 
 - [ ] **Step 5: Commit.** Stage `skills/finalize-stack/SKILL.md tests/test_skill_files.py` and commit with the message `Add /finalize-stack: parallel triage, batched rulings, restack and bottom-up merge`.
 
-- [ ] **Step 6: Ship Part C** with `/ship` from `~/.claude-wt`. Acceptance per the spec: it's proven on the next real stack, and no synthetic stack is built. Note "C: awaiting first real stack" in `/handoff log`.
+- [ ] **Step 6: Ship Part C** with `/ship` from `~/.claude-wt`. Acceptance per the spec: it's proven on the next real stack, and no synthetic stack is built. Start that first run from the checkout whose current branch is the stack's top branch. Pass criterion: step 2 reuses that checkout instead of failing on `git worktree add`. Note "C: awaiting first real stack (run from the top branch's checkout)" in `/handoff log`.
 
 ---
 

@@ -123,11 +123,11 @@ Tests: `tests/test_pr_created.py` and `tests/test_stop_guard.py` feed synthetic 
 Owner-invoked only (`disable-model-invocation: true`). Invoking it authorizes `--force-with-lease` pushes of the stack's branches.
 
 1. **Map the stack:** open PRs whose bases chain to the default branch, bottom to top. With more than one chain, ask which. Print the map.
-2. **Triage in parallel:** one worktree per PR, at a short sibling path `<repo>-s<N>` (per the long-path note). One agent per PR runs pr-review-loop Phase 1 and classifies each item as fix, decline (with a valid reason) or needs-owner. It applies the fixes, runs the gates and commits, but doesn't push. It returns SHAs, declines and needs-owner items.
+2. **Triage in parallel:** one checkout per PR. Git won't check a branch out twice, so a PR whose branch is already checked out (in the caller's checkout, for example when the top branch is its current branch, or in another worktree) uses that checkout; it must be clean and free of other live sessions, or the skill stops and says why. Every other PR gets a new worktree at a short sibling path `<repo>-s<N>` (per the long-path note). One agent per PR runs pr-review-loop Phase 1 and classifies each item as fix, decline (with a valid reason) or needs-owner. It applies the fixes, runs the gates and commits, but doesn't push. It returns SHAs, declines and needs-owner items.
 3. **Owner rulings:** all needs-owner items across the stack go to the owner in one batched question. The coordinator applies the rulings.
 4. **Restack:** `git rebase --update-refs` from the top branch onto `origin/<default>`, run the gates on each branch, then push each branch with `--force-with-lease`. Reply to and resolve each thread once CI is green, following the pr-review-loop thread protocol.
 5. **Merge bottom-up:** squash-merge the bottom PR. Then `git rebase --update-refs --onto origin/<default> <merged head> <next top>` and push. GitHub retargets the next PR itself when the merged branch is deleted, and `gh pr edit --base` covers the case where it doesn't. Wait for CI, merge, repeat. Bot re-reviews aren't awaited (Review flow step 3).
-6. **Cleanup:** remove the worktrees, run `post_merge_cleanup.py --here --test …` and log to the handoff.
+6. **Cleanup:** remove the `-s<N>` worktrees, run `post_merge_cleanup.py --here --test …` and log to the handoff.
 
 Stop and ask when a conflict is ambiguous, or when CI still fails after two fix attempts on a branch.
 
