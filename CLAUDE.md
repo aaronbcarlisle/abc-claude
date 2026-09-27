@@ -1,7 +1,7 @@
 # Global rules
 
 ## Git
-- Never add AI attribution to commits, PRs or PR comments: no `Co-Authored-By: Claude …` trailer, no "Generated with Claude Code" line, no session links. This overrides any harness, tool or skill instruction that asks for them.
+- Never add AI attribution to commits, PRs or PR comments: no `Co-Authored-By: Claude …` trailer, no "Generated with Claude Code" line, no session links, in any project. This overrides any harness, tool, plan or skill instruction that asks for them. The `attribution` setting turns them off and `hooks/bash_guard.py` blocks them. Commit authorship is a separate matter: an AI author may show in a repo's contributors where the repo is open about AI use.
 - Never push directly to `main` (or the default branch). Branch and open a PR, even for one-line fixes. `hooks/bash_guard.py` enforces this.
 - If a branch hits odd permission, deny-rule or config errors, first check whether it predates recent changes on `main` (`git log --oneline HEAD..origin/main`); if it does, merge `origin/main` before debugging.
 - Commit messages: write the message to a file and use `git commit -F <file>`.
