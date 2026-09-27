@@ -18,22 +18,34 @@ skipped; --here exempts the caller's own checkout. A failed switch or delete
 keeps that branch and the run goes on. Never commits and never pushes.
 --dry-run changes nothing (not even a fetch).
 
-Exit: 0 done, 1 tests failed, 2 refused or error.
+--test CMD runs through the platform shell (cmd.exe on Windows, /bin/sh
+elsewhere) in the main checkout, so quote inside CMD with double quotes only.
+It gets POST_MERGE_TEST_TIMEOUT seconds (default 1800); on timeout its whole
+process tree is killed and the tests count as failed.
+
+Exit: 0 done, 1 tests failed, 2 refused or error. An error mid-run still
+reports what was already deleted and kept.
 
 Tests: python -m unittest discover -s tests (from the repo root)
 """
 
 import argparse
+import datetime
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
+import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import handoff_state  # noqa: E402
 import live_sessions  # noqa: E402
 
 GH_UNAVAILABLE = "gh unavailable: merged-PR check skipped; squash-merged branches may be kept"
+TEST_TAIL = 40
+TEST_TIMEOUT = 1800
 
 
 class Refused(Exception):
@@ -130,10 +142,28 @@ def merged_pr(repo, branch, tip, fetch, notes=None):
     return None, seen
 
 
-def cleanup(args):
-    report = {"repo": None, "default": None, "sha": None, "deleted": [], "kept": [],
-              "removed_worktrees": [], "pulled": False, "tests": "skipped", "test_output": "",
-              "notes": [], "dry_run": bool(args.dry_run)}
+def new_report(args):
+    return {"repo": None, "default": None, "sha": None, "deleted": [], "kept": [],
+            "removed_worktrees": [], "pulled": False, "tests": "skipped", "test_output": "",
+            "notes": [], "dry_run": bool(args.dry_run)}
+
+
+def test_timeout():
+    """Seconds --test CMD may run: POST_MERGE_TEST_TIMEOUT, else TEST_TIMEOUT."""
+    value = os.environ.get("POST_MERGE_TEST_TIMEOUT", "").strip()
+    if not value:
+        return TEST_TIMEOUT
+    try:
+        seconds = float(value)
+    except ValueError:
+        seconds = 0
+    if not 0 < seconds < float("inf"):
+        raise Refused("POST_MERGE_TEST_TIMEOUT must be a positive number of seconds: %r" % value)
+    return seconds
+
+
+def cleanup(args, report):
+    """Fill `report` in place, so a caller that catches an error still sees what was done."""
     start = os.path.abspath(args.repo or os.getcwd())
     top = run(["git", "rev-parse", "--show-toplevel"], start, check=False) if os.path.isdir(start) else None
     if top is None or top.returncode != 0:
@@ -242,13 +272,104 @@ def short_sha(repo, default):
     return proc.stdout.strip() if proc.returncode == 0 else git(repo, "rev-parse", "--short", "HEAD")
 
 
+def kill_tree(proc):
+    """Kill `proc` and everything it started (it runs in its own session on POSIX)."""
+    try:
+        if os.name == "nt":
+            run(["taskkill", "/F", "/T", "/PID", str(proc.pid)], None, check=False)
+        else:
+            os.killpg(proc.pid, signal.SIGKILL)
+    except OSError:
+        pass
+    try:
+        proc.kill()
+        proc.wait(timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+
+def run_tests(cmd, repo, timeout):
+    """(exit code, output) of `cmd` run through the platform shell in `repo`. Output goes to
+    a temp file, not a pipe, so a leftover grandchild can't hold the wait open; on timeout
+    the whole process tree is killed and the result is a failure."""
+    with tempfile.TemporaryFile() as out:
+        proc = subprocess.Popen(cmd, shell=True, cwd=repo, stdin=subprocess.DEVNULL, stdout=out,
+                                stderr=subprocess.STDOUT, start_new_session=os.name != "nt")
+        try:
+            code, timed_out = proc.wait(timeout=timeout), False
+        except subprocess.TimeoutExpired:
+            kill_tree(proc)
+            code, timed_out = 1, True
+        out.seek(0)
+        lines = out.read().decode("utf-8", errors="replace").splitlines()
+    if timed_out:
+        lines.append("timed out after %g s" % timeout)
+    return code, lines
+
+
+def describe(items):
+    return ", ".join("%s (%s)" % (i["branch"], i["reason"]) for i in items) or "none"
+
+
+def progress_line(report):
+    stamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+    deleted = ", ".join(d["branch"] for d in report["deleted"]) or "none"
+    return "- %s | post-merge cleanup | tests %s | %s | deleted: %s; kept: %s" % (
+        stamp, report["tests"], report["sha"], deleted, describe(report["kept"]))
+
+
 def finish(repo, default, args, report):
-    """Pull, test and log. Task 4 fills this in."""
+    """Fast-forward the default branch, run the tests, and log to the handoff."""
+    notes = report["notes"]
+    if not args.dry_run:
+        current = git(repo, "branch", "--show-current")
+        if current != default:
+            notes.append("main checkout is on %s, not %s: pull skipped" % (current or "a detached HEAD", default))
+        elif dirty(repo, untracked=False):
+            notes.append("main checkout has uncommitted changes: pull skipped")
+        else:
+            pulled = run(["git", "pull", "--ff-only", "--quiet"], repo, check=False)
+            report["pulled"] = pulled.returncode == 0
+            if pulled.returncode != 0:
+                notes.append("pull failed: " + pulled.stderr.strip())
+        git(repo, "worktree", "prune")
     report["sha"] = short_sha(repo, default)
+
+    if args.test and not args.dry_run:
+        code, lines = run_tests(args.test, repo, args.timeout)
+        report["tests"] = "ok" if code == 0 else "fail"
+        if code != 0:
+            report["test_output"] = "\n".join(lines[-TEST_TAIL:])
+
+    handoff = args.handoff or os.path.join(repo, "SESSION_HANDOFF.md")
+    if not args.dry_run and (args.handoff or os.path.isfile(handoff)):
+        try:
+            handoff_state.append_progress(handoff, progress_line(report))
+        except (OSError, ValueError) as exc:
+            notes.append("handoff not written: %s" % exc)
 
 
 def render(report):
-    return json.dumps(report, indent=2)
+    if report.get("refused"):
+        return "post-merge cleanup refused: " + report["refused"]
+    failed = report.get("error")
+    if failed:
+        lines = ["post-merge cleanup failed: " + failed, "done before the failure:"]
+    else:
+        lines = ["%spost-merge cleanup: %s (default %s, HEAD %s)" % (
+            "DRY RUN, nothing changed. " if report["dry_run"] else "",
+            report["repo"], report["default"], report["sha"])]
+    lines.append("deleted: " + describe(report["deleted"]))
+    lines.append("kept: " + describe(report["kept"]))
+    if report["removed_worktrees"]:
+        lines.append("worktrees removed: " + ", ".join(report["removed_worktrees"]))
+    if not failed:
+        lines.append("pulled: " + ("yes" if report["pulled"] else "no"))
+        lines.append("tests: " + report["tests"])
+        if report["test_output"]:
+            lines.append(report["test_output"])
+    lines += ["note: " + note for note in report["notes"]]
+    return "\n".join(lines)
 
 
 def main(argv=None):
@@ -258,7 +379,9 @@ def main(argv=None):
     parser.add_argument("--repo", help="any path inside the repo (default: the current directory)")
     parser.add_argument("--here", action="store_true",
                         help="the caller is the session in the checkout holding the current directory")
-    parser.add_argument("--test", metavar="CMD", help="test command to run in the main checkout")
+    parser.add_argument("--test", metavar="CMD",
+                        help="test command to run in the main checkout, through the platform shell "
+                             "(cmd.exe on Windows): quote with double quotes only")
     parser.add_argument("--handoff", metavar="PATH", help="handoff file to log to")
     parser.add_argument("--dry-run", action="store_true", help="report what would happen; change nothing")
     parser.add_argument("--json", action="store_true", help="print the report as JSON")
@@ -267,13 +390,16 @@ def main(argv=None):
         args.repo = os.path.expanduser(args.repo)
     if args.handoff:
         args.handoff = os.path.expanduser(args.handoff)
+    report = new_report(args)
     try:
-        report = cleanup(args)
+        args.timeout = test_timeout() if args.test else None
+        cleanup(args, report)
         code = 1 if report["tests"] == "fail" else 0
     except Refused as exc:
         report, code = {"refused": str(exc)}, 2
-    except (RuntimeError, OSError, subprocess.SubprocessError) as exc:
-        report, code = {"error": str(exc)}, 2
+    except Exception as exc:
+        # Keep what was already deleted and kept: some of it can't be undone.
+        report, code = {"error": "%s: %s" % (type(exc).__name__, exc), **report}, 2
     print(json.dumps(report, indent=2) if args.json else render(report))
     return code
 

@@ -2,7 +2,7 @@
 
 install_stub writes `name.cmd` on Windows (subprocess and shutil.which find it
 through PATHEXT) and an executable sh script elsewhere; both run `script` with
-this Python.
+this Python. It mirrors the stub format of installer_harness.fake_claude.
 """
 
 import os
@@ -25,7 +25,11 @@ def install_stub(bin_dir, name, script):
 
 
 def git_env(tmp, **extra):
-    """os.environ plus an isolated git identity and config under `tmp`, plus `extra`."""
+    """os.environ plus an isolated git identity and config under `tmp`, plus `extra`.
+
+    GIT_CEILING_DIRECTORIES stops repository discovery at `tmp`, so a git call in
+    a directory under `tmp` that isn't a repo can never find an enclosing real one.
+    """
     config = os.path.join(tmp, "gitconfig")
     with open(config, "w", encoding="utf-8", newline="\n") as f:
         f.write("[user]\n\tname = Test\n\temail = test@example.com\n"
@@ -33,7 +37,11 @@ def git_env(tmp, **extra):
     env = dict(os.environ)
     for key in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE"):
         env.pop(key, None)
-    env.update(GIT_CONFIG_GLOBAL=config, GIT_CONFIG_NOSYSTEM="1", GIT_TERMINAL_PROMPT="0")
+    parent = os.path.dirname(os.path.abspath(tmp))
+    # Both spellings, in case one is an 8.3 short path (e.g. RUNNER~1 on CI).
+    ceilings = list(dict.fromkeys([parent, os.path.dirname(os.path.realpath(tmp))]))
+    env.update(GIT_CONFIG_GLOBAL=config, GIT_CONFIG_NOSYSTEM="1", GIT_TERMINAL_PROMPT="0",
+               GIT_CEILING_DIRECTORIES=os.pathsep.join(ceilings))
     env.update({key: str(value) for key, value in extra.items()})
     return env
 
