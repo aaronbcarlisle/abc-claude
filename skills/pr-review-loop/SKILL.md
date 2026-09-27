@@ -1,8 +1,8 @@
 ---
 name: pr-review-loop
-description: Continuous PR review loop — address every piece of review, bot, and CI feedback until the PR (or a stack of PRs) is clean, optionally rebasing a stack first. Run manually with /pr-review-loop.
-argument-hint: "[max-iterations] [#PR ...] [extra instructions]"
-disable-model-invocation: true
+description: Continuous PR review loop — address every piece of review, bot, and CI feedback until the PR (or a stack of PRs) is clean, optionally rebasing a stack first. With `ship`, squash-merge it once clean and run the post-merge cleanup. Invoke after a PR opens (the ship loop hands off here), or when asked to work through a PR's review feedback.
+argument-hint: "[ship] [max-iterations] [#PR ...] [extra instructions]"
+disable-model-invocation: false
 allowed-tools:
   - Bash(gh:*)
   - Bash(git:*)
@@ -11,8 +11,15 @@ allowed-tools:
   - Bash(pnpm:*)
   - Bash(curl:*)
   - Bash(bash:*)
+  - Bash(python:*)
+  - Bash(POST_MERGE_TEST_TIMEOUT=540 python *)
   - Monitor
   - TaskStop
+  - TodoWrite
+  - TaskCreate
+  - TaskUpdate
+  - TaskList
+  - AskUserQuestion
   - Read
   - Edit
   - Write
@@ -31,7 +38,9 @@ allowed-tools:
 - Arguments: `$ARGUMENTS`
 
 ## Interpret the arguments
-- A leading integer is max iterations (default 25).
+- `ship` anywhere in the arguments enables Phase 6: once the loop exits clean, merge and clean up.
+- A second `ship #N` for a PR this session's loop is already running on is a duplicate: ignore it and carry on with the running loop. That happens when the pr_created hook's note arrives after /ship's own hand-off.
+- A bare integer is max iterations (default 25).
 - `#N` tokens are the PRs to work on. If none are given, use the current-branch PR. If that is `NONE`, stop and tell the user there is no PR for this branch.
 - Anything else is an extra instruction from the user (e.g. "rebase the stack"). Do it before Phase 1 and follow the rules below.
 
@@ -127,7 +136,7 @@ Vercel:            [status | n/a]
 TOTAL:             [N]
 ═══════════════════════════════
 ```
-If TOTAL is 0 and CI is green for every PR, go to Phase 4.
+If TOTAL is 0 and CI is green for every PR, go to Phase 4. With `ship`, TOTAL 0 and CI still running also goes to Phase 4.
 
 ---
 
@@ -141,6 +150,8 @@ If TOTAL is 0 and CI is green for every PR, go to Phase 4.
    - For `pyproject.toml` or `Makefile` projects, read them to find the lint and test commands. If a needed tool is not pre-approved, request it once.
    - If there are no manifests, say so and rely on CI.
    - Never push failing validation.
+5. **Fix rounds get the gates only.** No local `/code-review` and no re-requested bot review for fix commits. One exception: record the PR head SHA when the loop starts. If this PR's fix commits change 50 or more lines outside tests and docs, and the repo has `.github/workflows/claude-code-review.yml`, post `@claude review` as a PR comment, once per PR. Count the lines as the insertions plus deletions this prints:
+   `git diff --shortstat <start-sha>..HEAD -- . ':(exclude)*test*' ':(exclude)*.md' ':(exclude)docs/**'`
 
 **Stop and ask first for:** architectural changes, breaking API changes, or ambiguous feedback. Keep working on everything else, then report the blocked items.
 
@@ -172,25 +183,48 @@ Verify all checks pass. Foreground `sleep` is blocked, so never wait on CI with 
 ## Phase 4 — Monitor loop
 
 One iteration is one push cycle. After each push:
-1. Wait for CI (the background `gh pr checks --watch` from Phase 3).
-2. Wait for bot re-reviews with the **Monitor** tool (`timeout_ms: 360000`). This command polls every 30s for 5 minutes and prints one line per new or edited review, inline comment or PR comment since the push commit, then exits:
+1. Wait for CI (the background `gh pr checks --watch` from Phase 3). If this loop hasn't pushed yet (a fresh PR from /ship), start `gh pr checks <PR> --watch --interval 30` with Bash `run_in_background` now.
+2. Wait for reviewers with the **Monitor** tool (`timeout_ms: 1500000`). The command below does two things, then prints `quiet window over` and exits:
+   - It polls every 30 s until no review request is pending and every check run on the head SHA whose name contains `review` has finished, up to 15 minutes. It waits at least one minute, so a review request that registers late isn't missed.
+   - Then it holds a 2-minute quiet window for summary edits.
+   Throughout, it prints one line per new or edited review, inline comment or PR comment since the push commit.
+   - A failed `gh` query (auth, API or network error) never counts as "nothing pending": `waiting` prints `error`, which isn't `0`, so the poll retries 30 s later. It prints `review status query failed` once. If the last poll still failed when the 15 minutes end, it prints `review status unknown: gh query failed`. That means the wait is **not clean**: don't merge, report it as blocked (see the exit rules below).
    ```bash
+   sha=$(git rev-parse HEAD)
    since=$(TZ=UTC git log -1 --date=format-local:%Y-%m-%dT%H:%M:%SZ --format=%cd)
-   for i in 1 2 3 4 5 6 7 8 9 10; do
+   events() {
      gh api "repos/{owner}/{repo}/pulls/<PR>/reviews" --jq ".[] | select(.submitted_at > \"$since\" and .user.login != \"<me>\") | \"review \(.id) by \(.user.login)\"" || true
      gh api "repos/{owner}/{repo}/pulls/<PR>/comments?since=$since" --jq ".[] | select(.user.login != \"<me>\") | \"inline \(.id) by \(.user.login) at \(.updated_at)\"" || true
      gh api "repos/{owner}/{repo}/issues/<PR>/comments?since=$since" --jq ".[] | select(.user.login != \"<me>\") | \"comment \(.id) by \(.user.login) at \(.updated_at)\"" || true
-     sleep 30
-   done | while IFS= read -r ev; do   # print each event once
+   }
+   waiting() {   # pending review requests + unfinished review check runs on the head SHA; "error" if a query fails
+     p=$(gh pr view <PR> --json reviewRequests --jq '.reviewRequests | length' 2>/dev/null) || { echo error; return; }
+     r=$(gh api "repos/{owner}/{repo}/commits/$sha/check-runs" --jq '[.check_runs[] | select((.name | test("review"; "i")) and .status != "completed")] | length' 2>/dev/null) || { echo error; return; }
+     case "$p$r" in ''|*[!0-9]*) echo error; return ;; esac   # empty or non-numeric output is a failure too
+     echo $(( p + r ))
+   }
+   {
+     w=error
+     for i in $(seq 1 30); do
+       events
+       w=$(waiting)
+       [ "$w" = error ] && echo "review status query failed"
+       [ "$i" -ge 2 ] && [ "$w" = 0 ] && break
+       sleep 30
+     done
+     [ "$w" = error ] && echo "review status unknown: gh query failed"
+     for i in 1 2 3 4; do events; sleep 30; done
+   } | while IFS= read -r ev; do   # print each event once
      case "$seen" in *"|$ev|"*) ;; *) seen="$seen|$ev|"; echo "$ev" ;; esac
    done
    echo "quiet window over"
    ```
-   The `?since=` filter matches on update time, so a bot editing its summary in place shows up as a new line.
+   The `?since=` filter matches on update time, so a bot editing its summary in place shows up as a new line. `review status query failed` and `review status unknown: …` aren't feedback: don't return to Phase 1 for them. If the Monitor ends at its deadline without printing `quiet window over`, treat it as `review status unknown`: run the wait once more, then report blocked.
 3. If new feedback appears, stop the monitor with TaskStop and return to Phase 1. Phase 1 re-reads everything, so anything that lands later is caught on the next iteration.
 
 Exit when any of these is true:
-- **Clean:** the sweep shows 0 open threads on every PR, CI is green, and no new feedback arrived during the quiet window.
+- **Clean:** the sweep shows 0 open threads on every PR, CI is green, no new feedback arrived during the quiet window, and the wait didn't print `review status unknown`. With `ship`, go to Phase 6, then Phase 5.
+- **Review status unknown:** the wait printed `review status unknown: gh query failed`, so it never established that reviewers finished. That isn't clean. Run one more Phase 4 wait; if it prints the same line again, report "blocked: review status unknown (gh query failed)" and stop without merging.
 - **Max iterations reached:** report the remaining items.
 - **Blocked:** every remaining item needs user input, so report and ask.
 
@@ -217,10 +251,52 @@ If the user sees "phantom" unresolved threads on GitHub, tell them to hard-refre
 
 ---
 
+## Phase 6 — Ship (only with `ship`)
+
+Check every condition fresh, right before merging:
+```bash
+gh pr view <PR> --json isDraft,labels,baseRefName,mergeStateStatus,headRefOid --jq '{draft: .isDraft, labels: [.labels[].name], base: .baseRefName, state: .mergeStateStatus, head: .headRefOid}'
+gh repo view --json defaultBranchRef --jq .defaultBranchRef.name
+gh pr checks <PR> --json name,bucket --jq '[.[] | select(.bucket != "pass" and .bucket != "skipping")] | length'
+bash "${CLAUDE_SKILL_DIR}/scripts/threads.sh" <PR>
+```
+Merge only when all of these hold:
+- the PR isn't a draft and has no `no-automerge` label. Otherwise report "auto-merge off: <draft | no-automerge>" and stop.
+- its base is the default branch. Otherwise report "stacked: run /finalize-stack" and stop.
+- `head` equals `git rev-parse HEAD` (nothing landed since the last check);
+- the checks query prints `0`;
+- `threads.sh` prints nothing;
+- no item in this loop's task list is waiting on the owner;
+- the last Phase 4 wait didn't print `review status unknown`. Otherwise report "blocked: review status unknown (gh query failed)" and stop.
+- `mergeStateStatus` is `CLEAN`. On `UNKNOWN`, re-query up to 3 times, 30 s apart. Any other state (`BLOCKED`, `BEHIND`, `DIRTY`, `UNSTABLE`): report it and stop.
+
+If the checks query counts only pending checks, wait on that background watch and re-check everything. A failing check goes back to Phase 1. `UNSTABLE` or `BLOCKED` while checks are pending counts as pending, not a stop. To tell pending from failing, drop `| length` from the checks query: it then lists each check's `bucket` (`pending`, `fail` or `cancel`).
+
+If a condition fails for a reason only the owner can resolve, report it and stop without merging. Then:
+```bash
+gh pr merge --squash <PR>          # this argument order matches the permission allow rule
+gh pr view <PR> --json mergeCommit --jq .mergeCommit.oid
+POST_MERGE_TEST_TIMEOUT=540 python "$HOME/.claude/scripts/post_merge_cleanup.py" --repo . --here --test '<gate test command>'
+```
+Run the cleanup with the Bash tool's `timeout: 600000`. If it still moves to the background, wait for its completion notification; never start a second run.
+
+`<gate test command>` is the test command from Phase 2 step 4's discovery (the same one /ship's gates used; a test command in CLAUDE.md or AGENTS.md wins). Pass it single-quoted in Bash. Inside it use double quotes only, because on Windows the script runs it through cmd.exe: no `$VAR`, `'…'`, `~` or `2>/dev/null`. Don't wrap it in `bash -c` and don't switch shells. Omit `--test` when the repo has no test command.
+
+Reading the cleanup's exit code and output:
+- Report the merge SHA and the cleanup output.
+- Exit 1: `tests: fail` on the default branch after the merge. Report it first, in bold, with the output tail. If the tail ends `timed out after 540 s`, say the tests timed out instead.
+- Exit 2: either `post-merge cleanup refused: <reason>` (nothing changed) or `post-merge cleanup failed: <error>` followed by what was already deleted or kept. Report the line as printed.
+- Exit 0 with `tests: skipped` isn't a failure. Report the `note:` that says why: a live session or uncommitted changes in the main checkout, main not on the default branch, or pull failed. Without `--test` there is no note: the tests are always skipped.
+- A kept branch `checked out in this session's worktree` is expected; tell the owner to remove that worktree after the session ends.
+- Run it from this session's checkout: `--repo .` and `--here` both follow the current directory, and the handoff line goes to that checkout's SESSION_HANDOFF.md, when it has one.
+
+---
+
 ## Guardrails
 
 **Never:**
 - Plain `--force` push, or `--force-with-lease` outside a user-requested rebase
+- Merge without the `ship` argument, or while any Phase 6 condition fails
 - Use `--no-verify`
 - Batch-resolve threads without verification
 - Resolve a thread without replying first
