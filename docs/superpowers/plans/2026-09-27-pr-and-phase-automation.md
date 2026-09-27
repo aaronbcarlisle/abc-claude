@@ -1502,7 +1502,7 @@ def render(report):
 **Interfaces:**
 - Produces:
   - On a non-draft `gh pr create` whose output holds a PR URL, the hook prints `{"hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": "PR #N opened (<url>). Continue in this turn: invoke the pr-review-loop skill with `ship #N`."}}`.
-  - Marker directory: `CLAUDE_SHIP_STATE_DIR`, otherwise `~/.claude/state/ship`. The marker file is named after the session id. Task 7's `/ship` writes and removes it.
+  - Marker directory: `CLAUDE_SHIP_STATE_DIR`, otherwise `~/.claude/state/ship`. The marker file is named after the hook input's `session_id`. Task 7's `/ship` writes and removes it as `$HOME/.claude/state/ship/${CLAUDE_SESSION_ID}`; Claude Code substitutes the same session ID into the skill text (a documented skill string substitution, https://code.claude.com/docs/en/skills). Task 7's `test_ship_marker_path_is_the_one_pr_created_reads` checks the two paths agree. A missing marker fails safe: the hook repeats the hand-off, which ship mode ignores as a duplicate.
 
 - [ ] **Step 1: Write the failing hook tests** in `tests/test_pr_created.py`:
 
@@ -1963,9 +1963,12 @@ and the automation wiring between skills, hooks and scripts holds.
     python -m unittest discover -s tests
 """
 
+import json
 import os
 import re
 import subprocess
+import sys
+import tempfile
 import unittest
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -2053,6 +2056,39 @@ class ShipLoopTest(unittest.TestCase):
         self.assertIn("ship #", text)
         self.assertIn("Never `--draft`", text)
         self.assertNotIn("gh pr create --draft", text)
+        self.assertIn("that's the same hand-off: invoke pr-review-loop once", text)
+
+    def test_ship_marker_path_is_the_one_pr_created_reads(self):
+        # ${CLAUDE_SESSION_ID} is a documented skill-text substitution for the current session ID
+        # (https://code.claude.com/docs/en/skills, "Available string substitutions"); pr_created.py
+        # gets the same ID as the hook input's `session_id`. Build the path the skill text names,
+        # with the ID substituted, and check that the hook stays quiet on it.
+        text = body(skill("ship"))
+        marker = '"$HOME/.claude/state/ship/${CLAUDE_SESSION_ID}"'
+        self.assertIn("touch %s" % marker, text)
+        self.assertIn("rm -f %s" % marker, text)
+        session = "0b6f3c1e-7a1d-4c3e-9a55-1f0e2d3c4b5a"
+        payload = json.dumps({"session_id": session, "hook_event_name": "PostToolUse", "tool_name": "Bash",
+                              "tool_input": {"command": "gh pr create --title T --body-file b.md"},
+                              "tool_response": {"stdout": "https://github.com/o/r/pull/5\n", "stderr": ""}})
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as home:
+            env = dict(os.environ, HOME=home, USERPROFILE=home)  # expanduser("~") on POSIX and Windows
+            for key in ("CLAUDE_SHIP_STATE_DIR", "CLAUDE_SHIP_DISABLE"):
+                env.pop(key, None)
+
+            def hook():
+                proc = subprocess.run([sys.executable, os.path.join(REPO, "hooks", "pr_created.py")],
+                                      input=payload, capture_output=True, encoding="utf-8", env=env, timeout=20)
+                return proc.stdout
+
+            self.assertIn("`ship #5`", hook())  # no marker: the hook hands off (a duplicate is tolerated)
+            path = marker.strip('"').replace("$HOME", home).replace("${CLAUDE_SESSION_ID}", session)
+            os.makedirs(os.path.dirname(path))
+            open(path, "w").close()
+            self.assertEqual(hook(), "")  # inside /ship: quiet
+
+    def test_ship_mode_ignores_a_duplicate_hand_off(self):
+        self.assertIn("is a duplicate: ignore it", body(skill("pr-review-loop")))
 
     def test_claude_md_names_the_ship_loop(self):
         self.assertIn("Open PRs with `/ship`", body(os.path.join(REPO, "CLAUDE.md")))
@@ -2064,7 +2100,7 @@ if __name__ == "__main__":
 
 - [ ] **Step 2: Run them to watch them fail.** Run `python -m unittest tests.test_skill_files -v`. Expected:
   - `SkillFilesTest` passes, since it covers the current skills;
-  - every `ShipLoopTest` test fails, with missing `ship` or `disable-model-invocation: true`.
+  - every `ShipLoopTest` test fails, with missing `ship`, `disable-model-invocation: true` or a missing `skills/ship/SKILL.md`.
 
 - [ ] **Step 3: Create** `skills/ship/SKILL.md`:
 
@@ -2122,6 +2158,7 @@ Unless skipped, invoke the `code-review` skill with `<level> <branch> --fix`, so
 ## 5. Open the PR
 1. Mark this session as shipping, so the pr_created hook stays quiet:
    `mkdir -p "$HOME/.claude/state/ship" && touch "$HOME/.claude/state/ship/${CLAUDE_SESSION_ID}"`
+   `${CLAUDE_SESSION_ID}` isn't an environment variable. Claude Code replaces it with the current session ID when it loads this skill ("Available string substitutions", https://code.claude.com/docs/en/skills), so the command already holds the literal ID. The hook reads the same ID from its input's `session_id` field ("Common input fields", https://code.claude.com/docs/en/hooks). If the marker is missing anyway, the hook's note only repeats step 6's hand-off (see step 6).
 2. `git push -u origin HEAD`
 3. Write the PR body to a scratchpad file with the Write tool:
    - what changed and why;
@@ -2134,7 +2171,7 @@ Unless skipped, invoke the `code-review` skill with `<level> <branch> --fix`, so
 5. `rm -f "$HOME/.claude/state/ship/${CLAUDE_SESSION_ID}"`
 
 ## 6. Hand off
-In the same turn, invoke the `pr-review-loop` skill with `ship #<N>`. Don't stop between opening the PR and handing off.
+In the same turn, invoke the `pr-review-loop` skill with `ship #<N>`. Don't stop between opening the PR and handing off. If the pr_created hook also asks for `ship #<N>` (its marker was missing), that's the same hand-off: invoke pr-review-loop once.
 ````
 
 - [ ] **Step 4: Edit `skills/pr-review-loop/SKILL.md`.** Apply these six edits exactly.
@@ -2161,6 +2198,7 @@ Add `  - Bash(python:*)` to `allowed-tools` after `  - Bash(bash:*)`.
 
 ```
 - `ship` anywhere in the arguments enables Phase 6: once the loop exits clean, merge and clean up.
+- A second `ship #N` for a PR this session's loop is already running on is a duplicate: ignore it and carry on with the running loop. That happens when the pr_created hook's note arrives after /ship's own hand-off.
 - A bare integer is max iterations (default 25).
 ```
 
