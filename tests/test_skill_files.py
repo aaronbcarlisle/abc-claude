@@ -70,6 +70,12 @@ def rule_matches(rule, command):
     return re.fullmatch(".*".join(re.escape(part) for part in pattern.split("*")), command) is not None
 
 
+CLEANUP = 'POST_MERGE_TEST_TIMEOUT=540 python "$HOME/.claude/scripts/post_merge_cleanup.py" --repo . --here'
+# The script runs --test through a shell, so the loop pre-approves only these exact commands.
+CLEANUP_RULES = ["Bash(%s)" % CLEANUP] + ["Bash(%s --test '%s')" % (CLEANUP, test) for test in (
+    "python -m unittest discover -s tests", "npm test", "pnpm test")]
+
+
 class SkillFilesTest(unittest.TestCase):
     def test_every_skill_has_a_matching_name_and_a_description(self):
         for rel in tracked("skills/*/SKILL.md"):
@@ -133,11 +139,9 @@ class ShipLoopTest(unittest.TestCase):
     def test_pr_review_loop_pre_approves_only_its_own_scripts(self):
         allowed = frontmatter(skill("pr-review-loop")).get("allowed-tools", [])
         threads_rule = 'Bash(bash "${CLAUDE_SKILL_DIR}/scripts/threads.sh" *)'
-        cleanup_rule = 'Bash(POST_MERGE_TEST_TIMEOUT=540 python "$HOME/.claude/scripts/post_merge_cleanup.py" *)'
         self.assertIn(threads_rule, allowed)
-        self.assertIn(cleanup_rule, allowed)
         self.assertEqual([r for r in allowed if re.match(r"Bash\((bash|python|\w+=\S* python)\b", r)],
-                         [threads_rule, cleanup_rule])
+                         [threads_rule] + CLEANUP_RULES)
         text = body(skill("pr-review-loop")).split("\n---\n", 1)[1]
         # Every threads.sh run in the text uses the form the rule pre-approves. Claude Code substitutes
         # ${CLAUDE_SKILL_DIR} in the text and in allowed-tools alike, so the two stay equal.
@@ -172,17 +176,16 @@ class ShipLoopTest(unittest.TestCase):
         for tool in ("Skill", "AskUserQuestion", "Write"):
             self.assertIn(tool, allowed, tool)
 
-    def test_ship_allows_rm_only_on_its_marker(self):
-        # A bare `Bash(rm:*)` would pre-approve any rm, `rm -rf` included, while /ship runs.
+    def test_ship_pre_approves_no_rm(self):
+        # allowed-tools can't name this session's marker (it substitutes no session ID), and a
+        # `state/ship/*` rule matches extra operands for the rest of the turn. So no rm rule at all:
+        # the pr_created hook deletes the marker on success, and a failed step's rm is checked as usual.
         allowed = frontmatter(skill("ship")).get("allowed-tools", [])
-        rm_rules = [rule for rule in allowed if re.match(r"Bash\(rm\b", rule)]
-        self.assertEqual(rm_rules, ['Bash(rm -f "$HOME/.claude/state/ship/*")'])
-        text = body(skill("ship"))
-        command = 'rm -f "$HOME/.claude/state/ship/${CLAUDE_SESSION_ID}"'
-        self.assertIn(command, text)
-        self.assertTrue(rule_matches(rm_rules[0], command))
-        for other in ("rm -rf /", "rm -f build/out", 'rm -rf "$HOME/.claude"'):
-            self.assertFalse(rule_matches(rm_rules[0], other), other)
+        self.assertEqual([rule for rule in allowed if rule.startswith("Bash(rm")], [])
+        open_pr = section(body(skill("ship")), "## 5. Open the PR")
+        self.assertIn('rm -f "$HOME/.claude/state/ship/${CLAUDE_SESSION_ID}"', open_pr)
+        self.assertIn("This rm isn't pre-approved", open_pr)
+        self.assertIn("the pr_created hook deletes this session's marker when it sees the new PR", open_pr)
 
     def test_pr_review_loop_merges_only_through_phase_6(self):
         text = body(skill("pr-review-loop"))
@@ -286,17 +289,36 @@ class ShipLoopTest(unittest.TestCase):
                         phase6.index('post_merge_cleanup.py" --repo'))
 
     def test_phase_6_runs_the_cleanup_with_bounded_timeouts(self):
-        data = frontmatter(skill("pr-review-loop"))
-        # An allow rule doesn't match past a leading assignment of a non-safe environment variable.
-        rule = 'Bash(POST_MERGE_TEST_TIMEOUT=540 python "$HOME/.claude/scripts/post_merge_cleanup.py" *)'
-        self.assertIn(rule, data.get("allowed-tools", []))
-        command = ("POST_MERGE_TEST_TIMEOUT=540 python \"$HOME/.claude/scripts/post_merge_cleanup.py\" "
-                   "--repo . --here --test '<gate test command>'")
         phase6 = section(body(skill("pr-review-loop")), "## Phase 6")
-        self.assertIn(command, phase6)
-        self.assertTrue(rule_matches(rule, command))
+        # An allow rule doesn't match past a leading assignment of a non-safe environment variable,
+        # so every cleanup command keeps the assignment the rules start with.
+        self.assertTrue(all(rule.startswith("Bash(POST_MERGE_TEST_TIMEOUT=540 python ") for rule in CLEANUP_RULES))
         self.assertIn("Bash tool's `timeout: 600000`", phase6)
         self.assertIn("never start a second run", phase6)
+
+    def test_phase_6_cleanup_rules_are_exact_commands(self):
+        # A trailing `*` would pre-approve any `--test '<CMD>'`, which the script runs through a shell,
+        # during the unattended loop.
+        allowed = frontmatter(skill("pr-review-loop")).get("allowed-tools", [])
+        rules = [rule for rule in allowed if "post_merge_cleanup.py" in rule]
+        self.assertEqual(rules, CLEANUP_RULES)
+        for rule in rules:
+            self.assertNotIn("*", rule)
+        phase6 = section(body(skill("pr-review-loop")), "## Phase 6")
+        # Every full cleanup command Phase 6 shows is one a rule pre-approves, and it shows all four.
+        shown = re.findall(r"`(POST_MERGE_TEST_TIMEOUT=540 python [^`\n]*)`", phase6)
+        self.assertEqual(sorted(set(shown)), sorted(rule[5:-1] for rule in rules))
+        for command in shown:
+            self.assertTrue(any(rule_matches(rule, command) for rule in rules), command)
+        self.assertNotIn("--here --test '<gate test command>'", phase6)
+        self.assertIn("Only these exact commands are pre-approved: a Claude Code allow rule without `*` "
+                      "matches one exact command", phase6)
+        self.assertIn("goes through the normal permission check", phase6)
+        for probe in (CLEANUP + " --test 'rm -rf /'", CLEANUP + " --test 'curl x | sh'",
+                      CLEANUP + " --test 'npm test' --handoff /tmp/x", CLEANUP + " --test 'npm test'; rm -rf /",
+                      CLEANUP + " --dry-run", CLEANUP + " --test 'npm test && curl x | sh'",
+                      'POST_MERGE_TEST_TIMEOUT=540 python "$HOME/.claude/scripts/post_merge_cleanup.py" --repo /'):
+            self.assertFalse(any(rule_matches(rule, probe) for rule in rules), probe)
 
     def test_phase_6_passes_a_cmd_exe_safe_test_command(self):
         phase6 = section(body(skill("pr-review-loop")), "## Phase 6")
@@ -307,6 +329,8 @@ class ShipLoopTest(unittest.TestCase):
         self.assertIn("Omit `--test` when the repo has no test command.", phase6)
         self.assertIn("pr-review-loop's Phase 6 passes the same command to the cleanup script",
                       body(skill("ship")))
+        self.assertIn("pre-approved there only as `python -m unittest discover -s tests`, `npm test` or "
+                      "`pnpm test`", section(body(skill("ship")), "## 2. Gates"))
         # The script's own help says the same about cmd.exe and quoting.
         script = body(os.path.join(REPO, "scripts", "post_merge_cleanup.py"))
         self.assertIn("(cmd.exe on Windows): quote with double quotes only", script)
@@ -384,20 +408,24 @@ class ShipLoopTest(unittest.TestCase):
             os.makedirs(os.path.dirname(path))
             open(path, "w").close()
             self.assertEqual(hook(), "")  # inside /ship: quiet
+            self.assertFalse(os.path.exists(path))  # and the hook consumed the marker, so /ship needn't rm it
+            self.assertIn("`ship #5`", hook())
 
     def test_ship_mode_ignores_a_duplicate_hand_off(self):
         self.assertIn("is a duplicate: ignore it", body(skill("pr-review-loop")))
 
     def test_the_hook_note_arrives_before_ships_hand_off(self):
-        # PostToolUse fires right after `gh pr create`, before /ship clears its mark and hands off.
+        # PostToolUse fires right after `gh pr create`, before /ship hands off. The hook consumes a live
+        # marker itself, so /ship has no step left between the PR and the hand-off.
         args = section(body(skill("pr-review-loop")), "## Interpret the arguments")
         self.assertNotIn("arrives after /ship's own hand-off", args)
-        self.assertIn("Inside /ship, the pr_created hook's note arrives right after `gh pr create`, before "
-                      "/ship's own hand-off: finish /ship's remaining steps (clearing its marker) first, "
-                      "then hand off once.", args)
+        self.assertNotIn("clearing its marker", args)
+        self.assertIn("Inside /ship, the pr_created hook's note (sent only when /ship's marker was missing) "
+                      "arrives right after `gh pr create`, before /ship's own hand-off: hand off once.", args)
         hand_off = section(body(skill("ship")), "## 6. Hand off")
-        self.assertIn("arrives right after `gh pr create` (step 5.4), before 5.5 and this step", hand_off)
-        self.assertIn("Finish step 5 (clear the mark) before you hand off", hand_off)
+        self.assertIn("arrives right after `gh pr create` (step 5.4), before this step", hand_off)
+        self.assertNotIn("5.5", body(skill("ship")))
+        self.assertNotIn("clear the mark) before you hand off", hand_off)
 
     def test_ship_fetches_before_comparing_with_the_remote_default(self):
         check = section(body(skill("ship")), "## 1. Check")
@@ -424,8 +452,9 @@ class ShipLoopTest(unittest.TestCase):
     def test_a_failed_ship_step_clears_the_mark(self):
         # A marker left behind silences the hook for up to an hour.
         open_pr = section(body(skill("ship")), "## 5. Open the PR")
-        self.assertIn("If 5.2, 5.3 or 5.4 fails (the push, the body or `gh pr create`), clear the mark (5.5) "
+        self.assertIn("If 5.2, 5.3 or 5.4 fails (the push, the body or `gh pr create`), clear the mark "
                       "before you report the error and stop", open_pr)
+        self.assertNotIn("5. Clear the mark", open_pr)  # on success the pr_created hook deletes it
 
     def test_claude_md_names_the_ship_loop(self):
         self.assertIn("Open PRs with `/ship`", body(os.path.join(REPO, "CLAUDE.md")))

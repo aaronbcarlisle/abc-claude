@@ -10,7 +10,10 @@ allowed-tools:
   - Bash(npx tsc *)
   - Bash(pnpm:*)
   - Bash(bash "${CLAUDE_SKILL_DIR}/scripts/threads.sh" *)
-  - Bash(POST_MERGE_TEST_TIMEOUT=540 python "$HOME/.claude/scripts/post_merge_cleanup.py" *)
+  - Bash(POST_MERGE_TEST_TIMEOUT=540 python "$HOME/.claude/scripts/post_merge_cleanup.py" --repo . --here)
+  - Bash(POST_MERGE_TEST_TIMEOUT=540 python "$HOME/.claude/scripts/post_merge_cleanup.py" --repo . --here --test 'python -m unittest discover -s tests')
+  - Bash(POST_MERGE_TEST_TIMEOUT=540 python "$HOME/.claude/scripts/post_merge_cleanup.py" --repo . --here --test 'npm test')
+  - Bash(POST_MERGE_TEST_TIMEOUT=540 python "$HOME/.claude/scripts/post_merge_cleanup.py" --repo . --here --test 'pnpm test')
   - Monitor
   - TaskStop
   - TodoWrite
@@ -37,7 +40,7 @@ allowed-tools:
 
 ## Interpret the arguments
 - `ship` anywhere in the arguments enables Phase 6: once the loop exits clean, merge and clean up.
-- Inside /ship, the pr_created hook's note arrives right after `gh pr create`, before /ship's own hand-off: finish /ship's remaining steps (clearing its marker) first, then hand off once. A second `ship #N` for a PR this session's loop is already running on is a duplicate: ignore it and carry on with the running loop.
+- Inside /ship, the pr_created hook's note (sent only when /ship's marker was missing) arrives right after `gh pr create`, before /ship's own hand-off: hand off once. A second `ship #N` for a PR this session's loop is already running on is a duplicate: ignore it and carry on with the running loop.
 - A bare integer is max iterations (default 25).
 - `#N` tokens are the PRs to work on. If none are given, use the current-branch PR. If that is `NONE`, stop and tell the user there is no PR for this branch.
 - Anything else is an extra instruction from the user (e.g. "rebase the stack"). Do it before Phase 1 and follow the rules below.
@@ -289,13 +292,16 @@ gh pr view <PR> --json mergeCommit --jq .mergeCommit.oid
 ```
 If it prints nothing or `null`, the merge isn't confirmed: report that and stop the same way.
 
-Then run the cleanup. Run it from this session's checkout: `--repo .` and `--here` both follow the current directory, and the handoff line goes to that checkout's SESSION_HANDOFF.md, when it has one.
-```bash
-POST_MERGE_TEST_TIMEOUT=540 python "$HOME/.claude/scripts/post_merge_cleanup.py" --repo . --here --test '<gate test command>'
-```
+Then run the cleanup. Run it from this session's checkout: `--repo .` and `--here` both follow the current directory, and the handoff line goes to that checkout's SESSION_HANDOFF.md, when it has one. Pick the command that fits the gate test command:
+- a `tests/test_*.py` suite: `POST_MERGE_TEST_TIMEOUT=540 python "$HOME/.claude/scripts/post_merge_cleanup.py" --repo . --here --test 'python -m unittest discover -s tests'`
+- a `package.json` repo whose test gate is its `test` script: `POST_MERGE_TEST_TIMEOUT=540 python "$HOME/.claude/scripts/post_merge_cleanup.py" --repo . --here --test 'npm test'`, or with pnpm `POST_MERGE_TEST_TIMEOUT=540 python "$HOME/.claude/scripts/post_merge_cleanup.py" --repo . --here --test 'pnpm test'`
+- no test command: `POST_MERGE_TEST_TIMEOUT=540 python "$HOME/.claude/scripts/post_merge_cleanup.py" --repo . --here`
+
+Only these exact commands are pre-approved: a Claude Code allow rule without `*` matches one exact command, and the script runs `--test` through a shell, so no rule may leave it open. Any other gate test command still works, passed the same way as `--test '<gate test command>'` after `--here`, but that run goes through the normal permission check.
+
 Run the cleanup with the Bash tool's `timeout: 600000`. If it still moves to the background, wait for its completion notification; never start a second run.
 
-`<gate test command>` is the test command from Phase 2 step 4's discovery (the same one /ship's gates used; a test command in CLAUDE.md or AGENTS.md wins). Pass it single-quoted in Bash. Inside it use double quotes only, because on Windows the script runs it through cmd.exe: no `$VAR`, `'…'`, `~` or `2>/dev/null`. Don't wrap it in `bash -c` and don't switch shells. For a repo whose only tests are `tests/test_*.py`, that's `--test 'python -m unittest discover -s tests'`, which is already safe. Omit `--test` when the repo has no test command.
+`<gate test command>` is the test command from Phase 2 step 4's discovery (the same one /ship's gates used; a test command in CLAUDE.md or AGENTS.md wins). Pass it single-quoted in Bash. Inside it use double quotes only, because on Windows the script runs it through cmd.exe: no `$VAR`, `'…'`, `~` or `2>/dev/null`. Don't wrap it in `bash -c` and don't switch shells. For a repo whose only tests are `tests/test_*.py`, that's `--test 'python -m unittest discover -s tests'`, which is already safe. For a `package.json` repo whose test gate is its `test` script, pass `--test 'npm test'` or `--test 'pnpm test'`, not Phase 2's `npm --prefix`/`pnpm --dir` form, so the run stays pre-approved. Omit `--test` when the repo has no test command.
 
 Reading the cleanup's exit code and output:
 - Report the merge SHA and the cleanup output.

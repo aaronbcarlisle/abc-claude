@@ -10,7 +10,12 @@ it. The PR is the first PR URL on the command's stdout. Silent when:
 - it runs inside a subagent (`agent_id`);
 - CLAUDE_SHIP_DISABLE=1 is set;
 - the session is already inside /ship: a marker file named after the
-  session_id in ~/.claude/state/ship/, under an hour old.
+  session_id in ~/.claude/state/ship/, under an hour old. /ship hands off
+  itself, so the hook consumes the marker instead: it deletes that one file
+  (best effort) and stays quiet, and the session's next PR hands off again.
+  /ship can't pre-approve that rm (allowed-tools substitutes no session ID),
+  so the hook does it. Only a session_id made of letters, digits, `_` and
+  `-` is ever looked up or deleted, and only inside the marker directory.
 CLAUDE_SHIP_STATE_DIR overrides the marker directory. Silent on any error, so
 it never blocks a tool call.
 
@@ -54,7 +59,7 @@ def output(response):
 
 
 def in_ship(session):
-    if not SESSION_ID.match(session):
+    if not SESSION_ID.fullmatch(session):
         return False
     try:
         return time.time() - os.path.getmtime(os.path.join(state_dir(), session)) < MARKER_TTL
@@ -72,7 +77,12 @@ def main():
     url = PR_URL.search(output(data.get("tool_response")))
     if not url:
         return
-    if in_ship(data.get("session_id") or ""):
+    session = data.get("session_id") or ""
+    if in_ship(session):
+        try:
+            os.remove(os.path.join(state_dir(), session))  # in_ship validated the session ID
+        except OSError:
+            pass
         return
     print(json.dumps({"hookSpecificOutput": {
         "hookEventName": "PostToolUse",

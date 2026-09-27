@@ -10,7 +10,6 @@ allowed-tools:
   - Bash(pnpm:*)
   - Bash(mkdir -p "$HOME/.claude/state/ship")
   - Bash(touch "$HOME/.claude/state/ship/*")
-  - Bash(rm -f "$HOME/.claude/state/ship/*")
   - Skill
   - AskUserQuestion
   - Read
@@ -37,7 +36,7 @@ allowed-tools:
 - If the PR for this branch is OPEN and not a draft, run step 2 (the gates), then `git push origin HEAD` so new local commits reach the PR, then go to step 6 with its number. Skip steps 3-5. If the push is rejected, report it and stop. If the PR is a draft, say so and stop: drafts opt out of auto-merge.
 
 ## 2. Gates
-Run the repo's gates with the same discovery as pr-review-loop Phase 2 step 4 (`package.json` scripts: lint → typecheck → test → build; `pyproject.toml` or `Makefile` commands; `tests/test_*.py` alone: `python -m unittest discover -s tests`; a repo test command in CLAUDE.md or AGENTS.md wins). All must pass. Gate commands outside this skill's allowed-tools go through the normal permission check. Run long gates with the Bash tool's `timeout: 600000` (up to 10 min), or in the background and wait for the notification. Remember the test command: pr-review-loop's Phase 6 passes the same command to the cleanup script.
+Run the repo's gates with the same discovery as pr-review-loop Phase 2 step 4 (`package.json` scripts: lint → typecheck → test → build; `pyproject.toml` or `Makefile` commands; `tests/test_*.py` alone: `python -m unittest discover -s tests`; a repo test command in CLAUDE.md or AGENTS.md wins). All must pass. Gate commands outside this skill's allowed-tools go through the normal permission check. Run long gates with the Bash tool's `timeout: 600000` (up to 10 min), or in the background and wait for the notification. Remember the test command: pr-review-loop's Phase 6 passes the same command to the cleanup script, pre-approved there only as `python -m unittest discover -s tests`, `npm test` or `pnpm test` (for a `package.json` repo whose test gate is its `test` script, pass `npm test` or `pnpm test`).
 
 ## 3. Size the review
 Run `git diff --shortstat origin/<default>...HEAD` and `git diff --name-only origin/<default>...HEAD`.
@@ -65,10 +64,12 @@ If it left changes that can't be committed cleanly (a file you can't tell apart 
 4. `gh pr create --title "<imperative title>" --body-file <file>`:
    - Base: the default branch, unless this branch is stacked on another open PR's head branch; then pass `--base <that branch>`.
    - Never `--draft`.
-5. Clear the mark. Run it with the Bash tool:
-   `rm -f "$HOME/.claude/state/ship/${CLAUDE_SESSION_ID}"`
 
-If 5.2, 5.3 or 5.4 fails (the push, the body or `gh pr create`), clear the mark (5.5) before you report the error and stop, so the marker doesn't silence the hook for up to an hour.
+When `gh pr create` succeeds, don't clear the mark yourself: the pr_created hook deletes this session's marker when it sees the new PR, and stays quiet.
+
+If 5.2, 5.3 or 5.4 fails (the push, the body or `gh pr create`), clear the mark before you report the error and stop, so the marker doesn't silence the hook for up to an hour. Run it with the Bash tool:
+   `rm -f "$HOME/.claude/state/ship/${CLAUDE_SESSION_ID}"`
+   This rm isn't pre-approved (an allow rule can't name this session's marker), so it goes through the normal permission check.
 
 ## 6. Hand off
-In the same turn, invoke the `pr-review-loop` skill with `ship #<N>`. Don't stop between opening the PR and handing off. If the pr_created hook also asks for `ship #<N>` (its marker was missing), that's the same hand-off: invoke pr-review-loop once. Its note arrives right after `gh pr create` (step 5.4), before 5.5 and this step. Finish step 5 (clear the mark) before you hand off.
+In the same turn, invoke the `pr-review-loop` skill with `ship #<N>`. Don't stop between opening the PR and handing off. If the pr_created hook also asks for `ship #<N>` (its marker was missing), that's the same hand-off: invoke pr-review-loop once. Its note arrives right after `gh pr create` (step 5.4), before this step.

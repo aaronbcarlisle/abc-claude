@@ -95,18 +95,55 @@ class PrCreatedTest(unittest.TestCase):
     def test_silent_when_disabled(self):
         self.assertIsNone(self.run_hook(env={"CLAUDE_SHIP_DISABLE": "1"}))
 
+    def mark(self, session="s1"):
+        os.makedirs(self.state, exist_ok=True)
+        marker = os.path.join(self.state, session)
+        open(marker, "w").close()
+        return marker
+
     def test_silent_inside_ship(self):
-        os.makedirs(self.state)
-        open(os.path.join(self.state, "s1"), "w").close()
+        self.mark()
         self.assertIsNone(self.run_hook())
 
+    def test_consumes_the_ship_marker_when_the_pr_opens(self):
+        # /ship can't pre-approve an rm of its own marker, so the hook deletes it once the PR exists.
+        marker = self.mark()
+        self.assertIsNone(self.run_hook())
+        self.assertFalse(os.path.exists(marker))
+        self.assertShip(self.run_hook())  # the next PR in this session hands off again
+
+    def test_keeps_the_marker_when_no_pr_opened(self):
+        marker = self.mark()
+        for kwargs in ({"command": "gh pr create --draft --title T"},
+                       {"stdout": "error: no commits\n"},
+                       {"stdout": "", "tool_response": {"stdout": "", "stderr": "https://github.com/o/r/pull/9\n"}},
+                       {"command": "gh pr view 42"},
+                       {"agent_id": "a1"},
+                       {"env": {"CLAUDE_SHIP_DISABLE": "1"}}):
+            self.assertIsNone(self.run_hook(**kwargs), kwargs)
+            self.assertTrue(os.path.exists(marker), kwargs)
+
+    def test_keeps_other_sessions_markers(self):
+        other = self.mark("s2")
+        self.assertShip(self.run_hook())
+        self.assertTrue(os.path.exists(other))
+
     def test_stale_ship_marker_is_ignored(self):
-        os.makedirs(self.state)
-        marker = os.path.join(self.state, "s1")
-        open(marker, "w").close()
+        marker = self.mark()
         old = time.time() - 2 * 3600
         os.utime(marker, (old, old))
         self.assertShip(self.run_hook())
+
+    def test_a_malformed_session_id_never_deletes_anything(self):
+        os.makedirs(self.state)
+        outside = os.path.join(self.tmp.name, "x")
+        open(outside, "w").close()
+        sibling = self.mark("s1")
+        for session in ("../x", "..\\x", os.path.join(self.state, "s1"), "s1\n", "s1/.", ""):
+            with self.subTest(session=session):
+                self.assertShip(self.run_hook(session_id=session))
+                self.assertTrue(os.path.exists(outside))
+                self.assertTrue(os.path.exists(sibling))
 
     def test_garbage_stdin_is_silent(self):
         proc = subprocess.run([sys.executable, HOOK], input="not json", capture_output=True,
