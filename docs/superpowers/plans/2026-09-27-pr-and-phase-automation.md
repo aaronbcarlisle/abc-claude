@@ -65,6 +65,7 @@
 3. **Non-ASCII branch names and handoff text on Windows** (cp1252 default decoding): the branch is deleted and reported intact, and the handoff line is written as UTF-8. Tests: `test_non_ascii_branch_name` in Task 3 and `test_utf8_bom_and_non_ascii_are_kept` in Task 2.
 4. **`gh pr create` whose quoted body contains `-d` or `--draft`, or a compound command:** body text must not count as the draft flag. A separate `-d` token elsewhere in the command line may silence the hook, which is the safe side. Tests: `test_draft_word_inside_quoted_body_is_not_a_draft` and `test_compound_command` in Task 5.
 5. **A headless run that crashes with no `result` event, or hits a usage limit with no reset time:** autopilot stops with `error`, or sleeps the default 30 minutes. It never spins. Tests: `test_crash_without_result_stops_with_error` and `test_usage_limit_without_reset_time_uses_default` in Task 12.
+6. **A Windows PID at or above `2**31`:** it's a valid DWORD PID, so `pid_alive` must ask `OpenProcess`, not call it dead (cleanup would then delete a live session's checkout). The narrower `2**31 - 1` bound applies only to the POSIX `os.kill` path. Tests: `test_windows_high_pids_reach_open_process` and `test_posix_rejects_pids_past_the_signed_bound` in Task 1.
 
 ---
 
@@ -80,7 +81,7 @@
 **Interfaces:**
 - Produces:
   - `sessions_dir() -> str`: reads `CLAUDE_SESSIONS_DIR`, otherwise `~/.claude/sessions`.
-  - `pid_alive(pid) -> bool`.
+  - `pid_alive(pid) -> bool`. The PID bound is per platform: Windows PIDs are DWORDs, so 1 to `2**32 - 1` reach the `OpenProcess` check (`_windows_pid_alive`); the POSIX `os.kill` path takes 1 to `2**31 - 1`.
   - `norm(path) -> str`.
   - `inside(path, root) -> bool`.
   - `live_sessions(directory=None) -> list[dict]`: each dict has `pid`, `cwd` and `file`.
@@ -107,6 +108,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCRIPT = os.path.join(REPO, "scripts", "live_sessions.py")
@@ -149,6 +151,27 @@ class LiveSessionsTest(unittest.TestCase):
     def test_bad_pids_are_dead(self):
         for pid in (None, 0, -1, "12", True, 2 ** 40):
             self.assertFalse(ls.pid_alive(pid), pid)
+
+    def test_windows_high_pids_reach_open_process(self):
+        # Windows PIDs are DWORDs: 2**31 .. 2**32-1 are valid and must be checked, not
+        # short-circuited as dead (cleanup would delete a live session's checkout).
+        # Patched, so no real high PID is needed and nothing is signalled.
+        seen = []
+        with mock.patch.object(ls, "WINDOWS", True), \
+                mock.patch.object(ls, "_windows_pid_alive", side_effect=lambda pid: seen.append(pid) or True), \
+                mock.patch.object(ls.os, "kill") as kill:
+            self.assertTrue(ls.pid_alive(2 ** 31))
+            self.assertTrue(ls.pid_alive(2 ** 32 - 1))
+            self.assertFalse(ls.pid_alive(2 ** 32))
+            self.assertFalse(ls.pid_alive(2 ** 40))
+        self.assertEqual(seen, [2 ** 31, 2 ** 32 - 1])
+        kill.assert_not_called()
+
+    def test_posix_rejects_pids_past_the_signed_bound(self):
+        with mock.patch.object(ls, "WINDOWS", False), mock.patch.object(ls.os, "kill") as kill:
+            self.assertFalse(ls.pid_alive(2 ** 31))
+            self.assertFalse(ls.pid_alive(2 ** 32 - 1))
+        kill.assert_not_called()
 
     def test_live_sessions_skips_unreadable_dead_and_malformed(self):
         good = self.write({"pid": os.getpid(), "cwd": self.root})
@@ -232,6 +255,9 @@ import json
 import os
 import sys
 
+WINDOWS = os.name == "nt"
+WINDOWS_PID_MAX = 2 ** 32 - 1  # PIDs are DWORDs
+POSIX_PID_MAX = 2 ** 31 - 1    # pid_t is a signed 32-bit int
 STILL_ACTIVE = 259
 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 ERROR_ACCESS_DENIED = 5
@@ -242,28 +268,36 @@ def sessions_dir():
         os.path.expanduser("~"), ".claude", "sessions")
 
 
+def _windows_pid_alive(pid):
+    """OpenProcess + GetExitCodeProcess. Never os.kill: on Windows it terminates."""
+    import ctypes
+    from ctypes import wintypes
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+    kernel32.GetExitCodeProcess.argtypes = (wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD))
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not handle:
+        return ctypes.get_last_error() == ERROR_ACCESS_DENIED  # exists, not ours
+    try:
+        code = wintypes.DWORD()
+        if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+            return True
+        return code.value == STILL_ACTIVE
+    finally:
+        kernel32.CloseHandle(handle)
+
+
 def pid_alive(pid):
-    """True while process `pid` runs. Never signals it: on Windows os.kill kills."""
-    if not isinstance(pid, int) or isinstance(pid, bool) or not 0 < pid < 2 ** 31:
+    """True while process `pid` runs. Never signals it on Windows, where os.kill kills.
+    The PID bound is per platform: a DWORD on Windows, a signed pid_t on POSIX."""
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
         return False
-    if os.name == "nt":
-        import ctypes
-        from ctypes import wintypes
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        kernel32.OpenProcess.restype = wintypes.HANDLE
-        kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
-        kernel32.GetExitCodeProcess.argtypes = (wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD))
-        kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
-        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
-        if not handle:
-            return ctypes.get_last_error() == ERROR_ACCESS_DENIED  # exists, not ours
-        try:
-            code = wintypes.DWORD()
-            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
-                return True
-            return code.value == STILL_ACTIVE
-        finally:
-            kernel32.CloseHandle(handle)
+    if WINDOWS:
+        return pid <= WINDOWS_PID_MAX and _windows_pid_alive(pid)
+    if pid > POSIX_PID_MAX:
+        return False
     try:
         os.kill(pid, 0)
     except PermissionError:
