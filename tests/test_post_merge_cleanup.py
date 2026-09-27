@@ -9,11 +9,14 @@ first on PATH, then runs the script as a subprocess.
 
 import json
 import os
+import shutil
+import signal
 import subprocess
 import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 from stubs import git, git_env, install_stub
 
@@ -23,6 +26,7 @@ FAKE_GH = os.path.join(REPO, "tests", "fake_gh.py")
 
 sys.path.insert(0, os.path.join(REPO, "scripts"))
 import live_sessions  # noqa: E402
+import post_merge_cleanup  # noqa: E402
 
 
 class CleanupCase(unittest.TestCase):
@@ -102,6 +106,26 @@ class CleanupCase(unittest.TestCase):
     def worktree(self, name, branch):
         path = os.path.join(self.tmp.name, name)
         git(self.work, self.env, "worktree", "add", "-q", path, branch)
+        return path
+
+    def merged_worktree(self, branch, number):
+        """A pushed branch checked out in a clean worktree, then squash-merged as PR `number`."""
+        self.pushed_branch(branch)
+        path = self.worktree("wt-%d" % number, branch)
+        self.squash_merge(branch, number)
+        return path
+
+    def ignore(self, patterns):
+        """Commit and push a .gitignore on main, before any branch is made from it."""
+        self.commit(self.work, ".gitignore", "".join(p + "\n" for p in patterns), "ignore")
+        git(self.work, self.env, "push", "-q", "origin", "main")
+
+    @staticmethod
+    def write(root, name, text="x\n"):
+        path = os.path.join(root, *name.split("/"))
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            f.write(text)
         return path
 
     def live_session(self, cwd, pid=None):
@@ -318,6 +342,101 @@ class WorktreeTest(CleanupCase):
         self.assertEqual(self.deleted(r), {"feat/b"})
         self.assertTrue(os.path.exists(path))
 
+    def test_ignored_session_files_keep_the_worktree(self):
+        # `git worktree remove` deletes ignored files, so an ignored handoff, SDD
+        # ledger or .env would be lost with no copy anywhere.
+        self.ignore(["SESSION_HANDOFF.md", ".env", ".env.*"])
+        cases = {
+            "feat/a": ["SESSION_HANDOFF.md"],
+            # Superpowers' SDD workspace ignores itself with its own `*` .gitignore.
+            "feat/b": [".superpowers/sdd/.gitignore", ".superpowers/sdd/progress.md"],
+            "feat/c": [".env.local"],
+            "feat/d": ["docs/SESSION_HANDOFF.md"],
+        }
+        paths = {}
+        for number, (branch, files) in enumerate(cases.items(), 1):
+            self.pushed_branch(branch)
+            paths[branch] = self.worktree("wt-%d" % number, branch)
+            for name in files:
+                self.write(paths[branch], name, "*\n" if name.endswith(".gitignore") else "keep me\n")
+            self.squash_merge(branch, number)
+        code, r = self.cleanup()
+        self.assertEqual(code, 0, r)
+        self.assertEqual(r["removed_worktrees"], [])
+        self.assertEqual(self.deleted(r), set())
+        kept = self.kept(r)
+        for branch, files in cases.items():
+            with self.subTest(branch=branch):
+                self.assertIn("session files", kept[branch])
+                self.assertIn(files[-1], kept[branch])
+                for name in files:
+                    self.assertTrue(os.path.isfile(os.path.join(paths[branch], *name.split("/"))), name)
+                self.assertIn(branch, self.branches())
+
+    def test_ignored_build_output_does_not_block_removal(self):
+        self.ignore(["__pycache__/", "*.pyc"])
+        path = self.merged_worktree("feat/a", 1)
+        self.write(path, "__pycache__/mod.cpython-312.pyc")
+        code, r = self.cleanup()
+        self.assertEqual(code, 0, r)
+        self.assertEqual(self.deleted(r), {"feat/a"})
+        self.assertFalse(os.path.exists(path))
+
+    def test_untracked_file_counts_even_when_status_hides_untracked_files(self):
+        git(self.work, self.env, "config", "status.showUntrackedFiles", "no")
+        path = self.merged_worktree("feat/a", 1)
+        self.write(path, "notes.txt")
+        code, r = self.cleanup()
+        self.assertEqual(code, 0, r)
+        self.assertIn("uncommitted or untracked", self.kept(r)["feat/a"])
+        self.assertTrue(os.path.isfile(os.path.join(path, "notes.txt")))
+
+    def test_worktree_with_modified_tracked_file_is_kept(self):
+        path = self.merged_worktree("feat/a", 1)
+        with open(os.path.join(path, "README.md"), "a", encoding="utf-8") as f:
+            f.write("edit\n")
+        code, r = self.cleanup()
+        self.assertEqual(code, 0, r)
+        self.assertIn("uncommitted or untracked", self.kept(r)["feat/a"])
+        self.assertTrue(os.path.exists(path))
+        self.assertIn("feat/a", self.branches())
+
+    def test_locked_worktree_is_kept(self):
+        path = self.merged_worktree("feat/a", 1)
+        git(self.work, self.env, "worktree", "lock", path)
+        code, r = self.cleanup()
+        self.assertEqual(code, 0, r)
+        self.assertIn("is locked", self.kept(r)["feat/a"])
+        self.assertTrue(os.path.exists(path))
+        self.assertIn("feat/a", self.branches())
+
+    def test_here_from_a_worktree_skips_a_live_main_checkout(self):
+        self.pushed_branch("feat/a")
+        self.squash_merge("feat/a", 1)
+        wt_b = self.merged_worktree("feat/b", 2)
+        self.pushed_branch("feat/c")
+        caller = self.worktree("wt-caller", "feat/c")
+        self.pushed_branch("feat/m")
+        self.squash_merge("feat/m", 3)
+        git(self.work, self.env, "switch", "-q", "feat/m")
+        head = git(self.work, self.env, "rev-parse", "HEAD")
+        self.live_session(self.work)
+        marker = os.path.join(self.tmp.name, "tests-ran")
+        cmd = '"%s" -c "open(r\'%s\', \'w\').close()"' % (sys.executable, marker)
+        code, r = self.cleanup("--here", "--test", cmd, cwd=caller)
+        self.assertEqual(code, 0, r)
+        self.assertEqual(self.deleted(r), {"feat/a", "feat/b"})
+        self.assertFalse(os.path.exists(wt_b))
+        self.assertIn("live session", self.kept(r)["feat/m"])
+        self.assertEqual(self.kept(r)["feat/c"], "not merged")
+        self.assertEqual(self.current(), "feat/m")
+        self.assertEqual(git(self.work, self.env, "rev-parse", "HEAD"), head)
+        self.assertIs(r["pulled"], False)
+        self.assertEqual(r["tests"], "skipped")
+        self.assertFalse(os.path.exists(marker), "the tests ran in a live main checkout")
+        self.assertTrue([n for n in r["notes"] if "live" in n and "pull" in n], r["notes"])
+        self.assertTrue([n for n in r["notes"] if n.startswith("tests skipped: ")], r["notes"])
+
 
 class RefusalTest(CleanupCase):
     def test_live_session_in_main_checkout_refuses(self):
@@ -325,6 +444,29 @@ class RefusalTest(CleanupCase):
         code, r = self.cleanup()
         self.assertEqual(code, 2, r)
         self.assertIn("live", r["refused"])
+
+    def test_live_main_checkout_refuses_a_worktree_caller_without_here(self):
+        self.pushed_branch("feat/a")
+        self.squash_merge("feat/a", 1)
+        self.pushed_branch("feat/c")
+        caller = self.worktree("wt-caller", "feat/c")
+        self.live_session(self.work)
+        code, r = self.cleanup(cwd=caller)
+        self.assertEqual(code, 2, r)
+        self.assertIn("live", r["refused"])
+        self.assertIn("feat/a", self.branches())
+
+    def test_refused_run_prunes_no_worktree(self):
+        # A worktree whose directory is gone (an unplugged drive, say) stays registered.
+        self.pushed_branch("feat/a")
+        path = self.worktree("wt-a", "feat/a")
+        shutil.rmtree(path)
+        before = git(self.work, self.env, "worktree", "list", "--porcelain")
+        self.assertIn("prunable", before)
+        self.live_session(self.work)
+        code, r = self.cleanup()
+        self.assertEqual(code, 2, r)
+        self.assertEqual(git(self.work, self.env, "worktree", "list", "--porcelain"), before)
 
     def test_dead_session_is_ignored(self):
         proc = subprocess.Popen([sys.executable, "-c", "pass"])
@@ -473,6 +615,16 @@ class FinishTest(CleanupCase):
         with open(helper, "w", encoding="utf-8", newline="\n") as f:
             f.write(SLEEPER)
         pids = os.path.join(self.tmp.name, "grandchild.pid")
+
+        def kill_grandchild():
+            try:
+                with open(pids, encoding="utf-8") as f:
+                    pid = int(f.read())
+            except (OSError, ValueError):
+                return
+            kill(pid)
+
+        self.addCleanup(kill_grandchild)
         self.env["POST_MERGE_TEST_TIMEOUT"] = "3"
         start = time.monotonic()
         code, r = self.cleanup("--test", '"%s" "%s" "%s"' % (sys.executable, helper, pids))
@@ -484,7 +636,6 @@ class FinishTest(CleanupCase):
         self.assertTrue(os.path.exists(pids), "the grandchild didn't start within the timeout")
         with open(pids, encoding="utf-8") as f:
             pid = int(f.read())
-        self.addCleanup(kill, pid)
         deadline = time.monotonic() + 20
         while live_sessions.pid_alive(pid) and time.monotonic() < deadline:
             time.sleep(0.1)
@@ -574,6 +725,62 @@ class FinishTest(CleanupCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("deleted: feat/a (PR #1 merged)", proc.stdout)
         self.assertIn("tests: skipped", proc.stdout)
+        header = proc.stdout.splitlines()[0]
+        sha = git(self.work, self.env, "rev-parse", "--short", "refs/heads/main")
+        self.assertIn("(default main %s)" % sha, header)
+        self.assertNotIn("HEAD", header)
+
+    def test_handoff_defaults_to_the_callers_worktree(self):
+        self.merged()
+        self.pushed_branch("feat/c")
+        caller = self.worktree("wt-caller", "feat/c")
+        main_handoff = self.handoff("\n")
+        with open(main_handoff, "rb") as f:
+            main_before = f.read()
+        mine = self.write(caller, "SESSION_HANDOFF.md", "# H\n\n## Progress Log\n- old\n")
+        code, r = self.cleanup("--repo", ".", "--here", cwd=caller)
+        self.assertEqual(code, 0, r)
+        with open(mine, encoding="utf-8") as f:
+            lines = f.read().splitlines()
+        self.assertEqual(lines[-2], "- old")
+        self.assertRegex(lines[-1], r"\| post-merge cleanup \| .*deleted: feat/a; kept: feat/c \(")
+        with open(main_handoff, "rb") as f:
+            self.assertEqual(f.read(), main_before)
+
+    SKIPPED = "tests skipped: main checkout is not on an up-to-date main"
+    FAILING = '"%s" -c "raise SystemExit(3)"' % sys.executable
+
+    def assert_tests_skipped(self, r, code, note=SKIPPED):
+        self.assertEqual(code, 0, r)
+        self.assertEqual(r["tests"], "skipped")
+        self.assertEqual(r["test_output"], "")
+        self.assertIn(note, r["notes"])
+
+    def test_tests_are_skipped_on_another_branch(self):
+        path = self.handoff("\n")
+        self.merged()
+        git(self.work, self.env, "switch", "-q", "-c", "fresh")
+        code, r = self.cleanup("--test", self.FAILING)
+        self.assert_tests_skipped(r, code)
+        with open(path, encoding="utf-8") as f:
+            self.assertIn("| tests skipped |", f.read().splitlines()[-1])
+
+    def test_tests_are_skipped_in_a_dirty_main_checkout(self):
+        self.merged()
+        with open(os.path.join(self.work, "README.md"), "a", encoding="utf-8") as f:
+            f.write("edit\n")
+        proc = self.run_script("--here", "--test", self.FAILING)
+        self.assertEqual(proc.returncode, 0, proc.stdout)
+        self.assertIn("tests: skipped", proc.stdout)
+        self.assertIn("note: " + self.SKIPPED, proc.stdout)
+
+    def test_tests_are_skipped_when_the_pull_fails(self):
+        # Local main has a commit origin lacks, so the fast-forward is impossible.
+        self.commit(self.work, "local.txt", "local\n", "local only")
+        self.merged()
+        code, r = self.cleanup("--test", self.FAILING)
+        self.assert_tests_skipped(r, code)
+        self.assertIs(r["pulled"], False)
 
     def test_human_output_for_a_refusal(self):
         self.live_session(self.work)
@@ -609,6 +816,30 @@ class FinishTest(CleanupCase):
         self.assertIn("deleted: feat/a (PR #1 merged)", proc.stdout)
 
 
+class PromptTest(unittest.TestCase):
+    def test_git_and_gh_never_prompt_for_credentials(self):
+        calls = []
+
+        def fake_run(argv, **kwargs):
+            calls.append((argv[0], kwargs.get("env")))
+            return subprocess.CompletedProcess(argv, 0, "{}", "")
+
+        prompting = {"GIT_TERMINAL_PROMPT": "1", "GCM_INTERACTIVE": "always"}
+        with mock.patch.dict(os.environ, prompting), \
+                mock.patch.object(post_merge_cleanup.subprocess, "run", fake_run), \
+                mock.patch.object(post_merge_cleanup.shutil, "which", return_value="gh"):
+            post_merge_cleanup.git(".", "status")
+            post_merge_cleanup.gh_json(".", "repo", "view")
+            path = os.environ["PATH"]
+        self.assertEqual([exe for exe, _ in calls], ["git", "gh"])
+        for exe, env in calls:
+            with self.subTest(exe=exe):
+                self.assertIsNotNone(env)
+                self.assertEqual(env["GIT_TERMINAL_PROMPT"], "0")
+                self.assertEqual(env["GCM_INTERACTIVE"], "never")
+                self.assertEqual(env["PATH"], path)
+
+
 def kill(pid):
     """Best-effort kill of a stray test process."""
     if not live_sessions.pid_alive(pid):
@@ -617,7 +848,10 @@ def kill(pid):
         subprocess.run(["taskkill", "/F", "/PID", str(pid)], capture_output=True,
                        encoding="utf-8", errors="replace")
     else:
-        os.kill(pid, 9)
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
 
 
 if __name__ == "__main__":

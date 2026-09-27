@@ -14,12 +14,17 @@ A checked-out branch whose tip is an ancestor but that was never pushed under
 its own name (its upstream isn't refs/heads/<branch>, e.g. it tracks the
 default or has none) is kept unless a merged PR contains its tip: it's new
 work that hasn't started. Checkouts with a live Claude Code session are
-skipped; --here exempts the caller's own checkout. A failed switch or delete
-keeps that branch and the run goes on. Never commits and never pushes.
---dry-run changes nothing (not even a fetch).
+skipped; --here exempts the caller's own checkout. A live main checkout
+refuses the run, unless --here, which skips it instead: no switch, pull or
+tests there. A worktree is removed only when it has no uncommitted or
+untracked files and no ignored session files (a handoff, .superpowers/, .env).
+A failed switch or delete keeps that branch and the run goes on. Never
+commits and never pushes. --dry-run changes nothing (not even a fetch).
 
 --test CMD runs through the platform shell (cmd.exe on Windows, /bin/sh
-elsewhere) in the main checkout, so quote inside CMD with double quotes only.
+elsewhere) in the main checkout, and only when that checkout is clean, on the
+default branch and pulled this run; otherwise the tests are skipped with a
+note. Quote inside CMD with double quotes only.
 It gets POST_MERGE_TEST_TIMEOUT seconds (default 1800); on timeout its whole
 process tree is killed and the tests count as failed.
 
@@ -53,7 +58,9 @@ class Refused(Exception):
 
 
 def run(argv, cwd, check=True):
-    proc = subprocess.run(argv, cwd=cwd, capture_output=True, encoding="utf-8", errors="replace")
+    # Unattended: a credential prompt would hang the run, so git and gh fail instead.
+    env = dict(os.environ, GIT_TERMINAL_PROMPT="0", GCM_INTERACTIVE="never")
+    proc = subprocess.run(argv, cwd=cwd, env=env, capture_output=True, encoding="utf-8", errors="replace")
     if check and proc.returncode != 0:
         raise RuntimeError("%s failed (%d): %s" % (" ".join(argv), proc.returncode, proc.stderr.strip()))
     return proc
@@ -119,9 +126,46 @@ def worktrees(repo):
     return found
 
 
-def dirty(path, untracked):
-    args = ["status", "--porcelain"] + ([] if untracked else ["--untracked-files=no"])
-    return bool(git(path, *args))
+def dirty(path):
+    """True when the main checkout at `path` has tracked changes; untracked files don't count."""
+    return bool(git(path, "status", "--porcelain", "--untracked-files=no"))
+
+
+def session_file(path):
+    """True for a path git can't restore that a session keeps: a SESSION_HANDOFF.md at any
+    depth, anything under .superpowers/, or a .env / .env.* file."""
+    parts = path.rstrip("/").split("/")
+    name = parts[-1]
+    return ".superpowers" in parts or name in ("SESSION_HANDOFF.md", ".env") or name.startswith(".env.")
+
+
+def worktree_state(path):
+    """(dirty, session_files) of the worktree at `path`. Untracked files count as dirty,
+    whatever status.showUntrackedFiles says. `git worktree remove` deletes ignored files too,
+    so session_files lists the ignored ones that must survive (see session_file); other
+    ignored files, such as caches and build output, don't block removal."""
+    fields = run(["git", "status", "--porcelain", "-z", "--ignored", "--untracked-files=all"],
+                 path).stdout.split("\0")
+    changed, found = False, []
+    i = 0
+    while i < len(fields):
+        entry, i = fields[i], i + 1
+        if len(entry) < 4:
+            continue
+        code, name = entry[:2], entry[3:]
+        if code == "!!":
+            if session_file(name):
+                found.append(name)
+            continue
+        changed = True
+        if "R" in code or "C" in code:
+            i += 1  # -z puts a rename's or copy's source path in the next field
+    return changed, found
+
+
+def listing(names, limit=5):
+    more = len(names) - limit
+    return ", ".join(names[:limit]) + (" and %d more" % more if more > 0 else "")
 
 
 def merged_pr(repo, branch, tip, fetch, notes=None):
@@ -168,9 +212,8 @@ def cleanup(args, report):
     top = run(["git", "rev-parse", "--show-toplevel"], start, check=False) if os.path.isdir(start) else None
     if top is None or top.returncode != 0:
         raise Refused("not a git repository: " + start)
-    if not args.dry_run:
-        git(top.stdout.strip(), "worktree", "prune")
-    trees = worktrees(top.stdout.strip())
+    top = top.stdout.strip()
+    trees = worktrees(top)
     main_tree = trees[0]
     if main_tree["bare"]:
         raise Refused("bare repository: " + main_tree["path"])
@@ -179,17 +222,23 @@ def cleanup(args, report):
     paths = [t["path"] for t in trees]
     here = live_sessions.owner(os.getcwd(), paths) if args.here else None
     live = {c: s for c, s in live_sessions.live_checkouts(paths).items() if c != here}
-    if repo in live:
-        raise Refused("a live Claude Code session is in the main checkout (pid %s)"
-                      % ", ".join(str(s["pid"]) for s in live[repo]))
-    main_dirty = dirty(repo, untracked=False)
+    main_live = ", ".join(str(s["pid"]) for s in live.get(repo, []))
+    if main_live and not args.here:
+        raise Refused("a live Claude Code session is in the main checkout (pid %s)" % main_live)
+    main_dirty = dirty(repo)
     if main_dirty and not args.here:
         raise Refused("the main checkout has uncommitted changes")
 
     notes = report["notes"]
     default = default_branch(repo, notes)
     report["default"] = default
+    if main_live:
+        notes.append("main checkout has a live session (pid %s): skipped, no switch, pull or tests there"
+                     % main_live)
     if not args.dry_run:
+        # Only now that nothing refused: a refused run changes nothing.
+        git(top, "worktree", "prune")
+        trees = worktrees(top)
         git(repo, "fetch", "--prune", "--quiet", "origin")
     target = "refs/remotes/origin/" + default
     checked_out = {t["branch"]: t for t in trees if t["branch"]}
@@ -225,6 +274,9 @@ def cleanup(args, report):
         if tree:
             path = tree["path"]
             if path == repo:
+                if main_live:
+                    keep("checked out in the main checkout, which has a live session")
+                    continue
                 if main_dirty:
                     keep("checked out in the main checkout, which has uncommitted changes")
                     continue
@@ -243,8 +295,13 @@ def cleanup(args, report):
                 keep("worktree %s is locked" % path)
                 continue
             elif not tree["prunable"]:
-                if dirty(path, untracked=True):
+                changed, kept_files = worktree_state(path)
+                if changed:
                     keep("worktree %s has uncommitted or untracked files" % path)
+                    continue
+                if kept_files:
+                    keep("worktree %s holds ignored session files (%s): remove it by hand"
+                         % (path, listing(kept_files)))
                     continue
                 if not args.dry_run:
                     removed = run(["git", "worktree", "remove", path], repo, check=False)
@@ -262,7 +319,7 @@ def cleanup(args, report):
                 continue
         report["deleted"].append({"branch": branch, "reason": why})
 
-    finish(repo, default, args, report)
+    finish(repo, default, args, report, top, bool(main_live))
     return report
 
 
@@ -318,30 +375,41 @@ def progress_line(report):
         stamp, report["tests"], report["sha"], deleted, describe(report["kept"]))
 
 
-def finish(repo, default, args, report):
-    """Fast-forward the default branch, run the tests, and log to the handoff."""
+def finish(repo, default, args, report, top, main_live):
+    """Fast-forward the default branch, run the tests, and log to the handoff. The tests run
+    only on a clean main checkout on `default` that this run pulled (or found up to date), so
+    their result is the default branch's. The handoff defaults to SESSION_HANDOFF.md at `top`,
+    the caller's checkout."""
     notes = report["notes"]
+    up_to_date = False
     if not args.dry_run:
         current = git(repo, "branch", "--show-current")
-        if current != default:
+        if main_live:
+            pass  # cleanup() already noted the skip
+        elif current != default:
             notes.append("main checkout is on %s, not %s: pull skipped" % (current or "a detached HEAD", default))
-        elif dirty(repo, untracked=False):
+        elif dirty(repo):
             notes.append("main checkout has uncommitted changes: pull skipped")
         else:
             pulled = run(["git", "pull", "--ff-only", "--quiet"], repo, check=False)
-            report["pulled"] = pulled.returncode == 0
+            report["pulled"] = up_to_date = pulled.returncode == 0
             if pulled.returncode != 0:
                 notes.append("pull failed: " + pulled.stderr.strip())
         git(repo, "worktree", "prune")
     report["sha"] = short_sha(repo, default)
 
     if args.test and not args.dry_run:
-        code, lines = run_tests(args.test, repo, args.timeout)
-        report["tests"] = "ok" if code == 0 else "fail"
-        if code != 0:
-            report["test_output"] = "\n".join(lines[-TEST_TAIL:])
+        if up_to_date:
+            code, lines = run_tests(args.test, repo, args.timeout)
+            report["tests"] = "ok" if code == 0 else "fail"
+            if code != 0:
+                report["test_output"] = "\n".join(lines[-TEST_TAIL:])
+        elif main_live:
+            notes.append("tests skipped: main checkout has a live session")
+        else:
+            notes.append("tests skipped: main checkout is not on an up-to-date " + default)
 
-    handoff = args.handoff or os.path.join(repo, "SESSION_HANDOFF.md")
+    handoff = args.handoff or os.path.join(top, "SESSION_HANDOFF.md")
     if not args.dry_run and (args.handoff or os.path.isfile(handoff)):
         try:
             handoff_state.append_progress(handoff, progress_line(report))
@@ -356,7 +424,7 @@ def render(report):
     if failed:
         lines = ["post-merge cleanup failed: " + failed, "done before the failure:"]
     else:
-        lines = ["%spost-merge cleanup: %s (default %s, HEAD %s)" % (
+        lines = ["%spost-merge cleanup: %s (default %s %s)" % (
             "DRY RUN, nothing changed. " if report["dry_run"] else "",
             report["repo"], report["default"], report["sha"])]
     lines.append("deleted: " + describe(report["deleted"]))
@@ -382,7 +450,9 @@ def main(argv=None):
     parser.add_argument("--test", metavar="CMD",
                         help="test command to run in the main checkout, through the platform shell "
                              "(cmd.exe on Windows): quote with double quotes only")
-    parser.add_argument("--handoff", metavar="PATH", help="handoff file to log to")
+    parser.add_argument("--handoff", metavar="PATH",
+                        help="handoff file to log to (default: SESSION_HANDOFF.md at the top of the "
+                             "checkout holding --repo or the current directory, if it exists)")
     parser.add_argument("--dry-run", action="store_true", help="report what would happen; change nothing")
     parser.add_argument("--json", action="store_true", help="print the report as JSON")
     args = parser.parse_args(argv)
