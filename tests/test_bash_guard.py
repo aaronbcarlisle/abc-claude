@@ -52,6 +52,8 @@ class PushGuardTest(unittest.TestCase):
         cls.feature_repo = make_clone(root, "featrepo", "main")
         git("checkout", "-q", "-b", "feat/x", cwd=cls.feature_repo)  # on a feature branch
         cls.master_repo = make_clone(root, "masterrepo", "master")    # default is master
+        cls.tracking_repo = make_clone(root, "trackrepo", "main")
+        git("checkout", "-q", "-b", "feat/y", "--track", "origin/main", cwd=cls.tracking_repo)
         cls.other = os.path.join(root, "elsewhere")
         os.makedirs(cls.other)
 
@@ -72,24 +74,57 @@ class PushGuardTest(unittest.TestCase):
         for cmd in ("git push origin main", "git push origin HEAD:main", "git push origin +feat/x:main",
                     "git push origin :main", "git push origin feat/x:refs/heads/main", "git push --all origin",
                     "GIT_TRACE=1 git push origin main", "git add -A && git push origin main",
-                    "git status\ngit push -u origin main"):
+                    "git status\ngit push -u origin main", "if git push origin main; then echo ok; fi",
+                    "git push origin 'refs/heads/*:refs/heads/*'", "git push origin :"):
             self.assertBlocked(cmd, self.feature_repo)
+        self.assertBlocked("$out = git push origin main 2>&1", self.feature_repo, tool="PowerShell")
 
     def test_feature_pushes_are_allowed(self):
         for cmd in ("git push -u origin feat/x", "git push", "git push origin HEAD",
                     "git push --force-with-lease origin feat/x",
-                    'git push -u origin feat/x && gh pr create --base main --title "t"'):
+                    'git push -u origin feat/x && gh pr create --base main --title "t"',
+                    "git push origin 'refs/heads/feat/*:refs/heads/feat/*'",
+                    "git push origin feat/x  # not main"):
             self.assertAllowed(cmd, self.feature_repo)
 
     def test_bare_push_while_on_default_is_blocked(self):
-        for cmd in ("git push", "git push origin HEAD", "git push -u origin HEAD"):
+        for cmd in ("git push", "git push origin HEAD", "git push -u origin HEAD", "git push origin @",
+                    "git push --repo=origin"):
             self.assertBlocked(cmd, self.main_repo)
+
+    def test_configured_bare_pushes_are_resolved(self):
+        # feat/y tracks origin/main: push.default=upstream sends it to main; simple refuses.
+        self.assertBlocked("git -c push.default=upstream push", self.tracking_repo)
+        self.assertAllowed("git push", self.tracking_repo)
+        self.assertBlocked("git -c push.default=matching push", self.feature_repo)
+        self.assertBlocked("git -c remote.origin.push=refs/heads/feat/x:refs/heads/main push", self.feature_repo)
+        self.assertAllowed("git -c remote.origin.push=refs/heads/feat/x:refs/heads/feat/x push", self.feature_repo)
+        git("config", "push.default", "upstream", cwd=self.tracking_repo)
+        try:
+            self.assertBlocked("git push", self.tracking_repo)
+            self.assertBlocked("git push origin", self.tracking_repo)
+        finally:
+            git("config", "--unset", "push.default", cwd=self.tracking_repo)
 
     def test_directory_changes_are_followed(self):
         self.assertBlocked('cd "%s" && git push' % self.main_repo, self.other)
         self.assertBlocked('git -C "%s" push' % self.main_repo, self.other)
         self.assertBlocked('Set-Location "%s"; git push' % self.main_repo, self.other, tool="PowerShell")
+        # Unquoted, so a Windows path's backslashes must survive PowerShell tokenizing.
+        self.assertBlocked("Set-Location %s; git push" % self.main_repo, self.other, tool="PowerShell")
+        self.assertBlocked('pushd "%s" && git push' % self.main_repo, self.other)
         self.assertAllowed('cd "%s" && git push' % self.feature_repo, self.main_repo)
+
+    def test_directory_changes_that_do_not_stick_are_undone(self):
+        missing = os.path.join(self.other, "missing")
+        self.assertBlocked('cd "%s"; git push' % missing, self.main_repo)
+        self.assertBlocked('(cd "%s" && git push); git push' % self.feature_repo, self.main_repo)
+        self.assertBlocked('(cd "%s" && git push origin HEAD)' % self.main_repo, self.feature_repo)
+        self.assertBlocked('pushd "%s"; popd; git push' % self.feature_repo, self.main_repo)
+        self.assertBlocked('Push-Location "%s"; Pop-Location; git push' % self.feature_repo, self.main_repo,
+                           tool="PowerShell")
+        # PowerShell parentheses aren't subshells: the location change sticks.
+        self.assertAllowed('(Set-Location "%s"); git push' % self.feature_repo, self.main_repo, tool="PowerShell")
 
     def test_default_branch_comes_from_the_remote(self):
         self.assertBlocked("git push origin master", self.master_repo)
@@ -124,7 +159,11 @@ class HeredocGuardTest(unittest.TestCase):
                     "cat >>progress.md << 'EOF'\nline\nEOF",
                     "tee notes.md <<'EOF' >/dev/null\nbody\nEOF",
                     "cat <<'EOF' | tee -a log.md\nline\nEOF",
-                    "mkdir -p d && cat > d/x.py <<-EOF\n\tprint(1)\n\tEOF"):
+                    "mkdir -p d && cat > d/x.py <<-EOF\n\tprint(1)\n\tEOF",
+                    "(cat <<'EOF'\nline\nEOF\n) > notes.md",
+                    "{ cat <<'EOF'; } > notes.md\nline\nEOF",
+                    "cat 1>notes.md <<\\EOF\nline\nEOF",
+                    "cat > notes.md <<'END-OF-NOTES'\nline\nEND-OF-NOTES"):
             code, err = run_hook(cmd, self.cwd)
             self.assertEqual(code, 2, cmd)
             self.assertIn("Write tool", err)
@@ -136,13 +175,18 @@ class HeredocGuardTest(unittest.TestCase):
                     "git commit -F - <<'EOF'\nsubject\nEOF",
                     "cat <<EOF\nshown only\nEOF",
                     "echo hi > out.txt",
-                    "sort a.txt > b.txt"):
+                    "sort a.txt > b.txt",
+                    "cat <<'EOF' | grep \">\" -\nline\nEOF",
+                    "cat <<'EOF' 2>err.log | python -\nprint(1)\nEOF",
+                    "x=$(cat <<'EOF'\nline\nEOF\n)"):
             self.assertEqual(run_hook(cmd, self.cwd), (0, ""), cmd)
 
     def test_powershell_herestring_file_writes_are_blocked(self):
         for cmd in ("@'\nline one\nline two\n'@ | Set-Content -Path notes.md",
                     "$t = @\"\nline\n\"@\nAdd-Content progress.md $t",
                     "@'\nline\n'@ > notes.md",
+                    "@'\nline\n'@ > \"notes.md\"",
+                    "@'\nline\n'@ | Out-File 'notes.md'",
                     "[IO.File]::WriteAllText('x.md', @'\nline\n'@)"):
             code, err = run_hook(cmd, self.cwd, tool="PowerShell")
             self.assertEqual(code, 2, cmd)
@@ -151,7 +195,11 @@ class HeredocGuardTest(unittest.TestCase):
     def test_powershell_herestrings_that_write_no_file_are_allowed(self):
         for cmd in ("$body = @'\nuse a > b here\n'@\ngh pr create --title t --body $body",
                     "git commit -m @'\nsubject\n'@",
-                    "Set-Content -Path x.txt -Value 'one line'"):
+                    "Set-Content -Path x.txt -Value 'one line'",
+                    "$b = @'\nbody\n'@\ngh pr create --title \"a > b\" --body $b",
+                    "$b = @'\nbody\n'@\ngh pr create --title 'Set-Content docs' --body $b",
+                    "$b = @'\nbody\n'@\ngh pr create --body $b 2>$null",
+                    "$b = @'\nDon't git push origin main\n'@\ngh pr comment 1 --body $b"):
             self.assertEqual(run_hook(cmd, self.cwd, tool="PowerShell"), (0, ""), cmd)
 
 
