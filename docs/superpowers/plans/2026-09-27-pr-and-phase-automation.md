@@ -2036,6 +2036,15 @@ class ShipLoopTest(unittest.TestCase):
         self.assertIn('post_merge_cleanup.py" --repo . --here', text)
         self.assertNotIn("sleep 30\n   done | while", text)  # the old fixed 5-minute window is gone
 
+    def test_a_failed_review_status_query_is_never_clean(self):
+        # gh auth/API/network failures must not read as "0 pending" and lead to a merge.
+        text = body(skill("pr-review-loop"))
+        self.assertNotIn("|| echo 0", text)
+        self.assertIn("|| { echo error; return; }", text)
+        self.assertIn('[ "$w" = error ] && echo "review status unknown: gh query failed"', text)
+        self.assertIn("didn't print `review status unknown`", text)  # Clean exit and Phase 6 condition
+        self.assertIn("blocked: review status unknown (gh query failed)", text)
+
     def test_ship_skill_hands_off_and_marks_the_session(self):
         data = frontmatter(skill("ship"))
         self.assertNotEqual(data.get("disable-model-invocation"), "true")
@@ -2169,6 +2178,7 @@ Add `  - Bash(python:*)` to `allowed-tools` after `  - Bash(bash:*)`.
    - It polls every 30 s until no review request is pending and every check run on the head SHA whose name contains `review` has finished, up to 15 minutes. It waits at least one minute, so a review request that registers late isn't missed.
    - Then it holds a 2-minute quiet window for summary edits.
    Throughout, it prints one line per new or edited review, inline comment or PR comment since the push commit.
+   - A failed `gh` query (auth, API or network error) never counts as "nothing pending": `waiting` prints `error`, which isn't `0`, so the poll retries 30 s later. It prints `review status query failed` once. If the last poll still failed when the 15 minutes end, it prints `review status unknown: gh query failed`. That means the wait is **not clean**: don't merge, report it as blocked (see the exit rules below).
    ```bash
    sha=$(git rev-parse HEAD)
    since=$(TZ=UTC git log -1 --date=format-local:%Y-%m-%dT%H:%M:%SZ --format=%cd)
@@ -2177,30 +2187,36 @@ Add `  - Bash(python:*)` to `allowed-tools` after `  - Bash(bash:*)`.
      gh api "repos/{owner}/{repo}/pulls/<PR>/comments?since=$since" --jq ".[] | select(.user.login != \"<me>\") | \"inline \(.id) by \(.user.login) at \(.updated_at)\"" || true
      gh api "repos/{owner}/{repo}/issues/<PR>/comments?since=$since" --jq ".[] | select(.user.login != \"<me>\") | \"comment \(.id) by \(.user.login) at \(.updated_at)\"" || true
    }
-   waiting() {   # pending review requests + unfinished review check runs on the head SHA
-     p=$(gh pr view <PR> --json reviewRequests --jq '.reviewRequests | length' 2>/dev/null || echo 0)
-     r=$(gh api "repos/{owner}/{repo}/commits/$sha/check-runs" --jq '[.check_runs[] | select((.name | test("review"; "i")) and .status != "completed")] | length' 2>/dev/null || echo 0)
-     echo $(( ${p:-0} + ${r:-0} ))
+   waiting() {   # pending review requests + unfinished review check runs on the head SHA; "error" if a query fails
+     p=$(gh pr view <PR> --json reviewRequests --jq '.reviewRequests | length' 2>/dev/null) || { echo error; return; }
+     r=$(gh api "repos/{owner}/{repo}/commits/$sha/check-runs" --jq '[.check_runs[] | select((.name | test("review"; "i")) and .status != "completed")] | length' 2>/dev/null) || { echo error; return; }
+     case "$p$r" in ''|*[!0-9]*) echo error; return ;; esac   # empty or non-numeric output is a failure too
+     echo $(( p + r ))
    }
    {
+     w=error
      for i in $(seq 1 30); do
        events
-       [ "$i" -ge 2 ] && [ "$(waiting)" = 0 ] && break
+       w=$(waiting)
+       [ "$w" = error ] && echo "review status query failed"
+       [ "$i" -ge 2 ] && [ "$w" = 0 ] && break
        sleep 30
      done
+     [ "$w" = error ] && echo "review status unknown: gh query failed"
      for i in 1 2 3 4; do events; sleep 30; done
    } | while IFS= read -r ev; do   # print each event once
      case "$seen" in *"|$ev|"*) ;; *) seen="$seen|$ev|"; echo "$ev" ;; esac
    done
    echo "quiet window over"
    ```
-   The `?since=` filter matches on update time, so a bot editing its summary in place shows up as a new line.
+   The `?since=` filter matches on update time, so a bot editing its summary in place shows up as a new line. `review status query failed` and `review status unknown: …` aren't feedback: don't return to Phase 1 for them.
 ````
 
 (e) Phase 4 exit. Replace `- **Clean:** the sweep shows 0 open threads on every PR, CI is green, and no new feedback arrived during the quiet window.` with:
 
 ```
-- **Clean:** the sweep shows 0 open threads on every PR, CI is green, and no new feedback arrived during the quiet window. With `ship`, go to Phase 6, then Phase 5.
+- **Clean:** the sweep shows 0 open threads on every PR, CI is green, no new feedback arrived during the quiet window, and the wait didn't print `review status unknown`. With `ship`, go to Phase 6, then Phase 5.
+- **Review status unknown:** the wait printed `review status unknown: gh query failed`, so it never established that reviewers finished. That isn't clean. Run one more Phase 4 wait; if it prints the same line again, report "blocked: review status unknown (gh query failed)" and stop without merging.
 ```
 
 Then insert this new section between Phase 5's closing paragraph (`...GraphQL is authoritative.`) and the `---` before `## Guardrails`:
@@ -2224,6 +2240,7 @@ Merge only when all of these hold:
 - the checks query prints `0`;
 - `threads.sh` prints nothing;
 - no item in this loop's task list is waiting on the owner;
+- the last Phase 4 wait didn't print `review status unknown`. Otherwise report "blocked: review status unknown (gh query failed)" and stop.
 - `mergeStateStatus` is `CLEAN`. On `UNKNOWN`, re-query up to 3 times, 30 s apart. Any other state (`BLOCKED`, `BEHIND`, `DIRTY`, `UNSTABLE`): report it and stop.
 
 If a condition fails for a reason only the owner can resolve, report it and stop without merging. Then:
