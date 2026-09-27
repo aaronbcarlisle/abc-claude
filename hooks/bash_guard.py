@@ -16,6 +16,15 @@ Enforces two global rules from CLAUDE.md that prose alone didn't hold:
      or `tee` that lands in a file, also through a `( )` or `{ }` group, and a
      PowerShell here-string written with Set-Content, Add-Content, Out-File or
      a redirect. Heredocs that feed a program (`python - <<'EOF'`) stay allowed.
+  3. Never add AI attribution to a commit message or PR/issue text. Blocks a
+     `git commit`/`git merge` `-m`/`-F`/`--trailer` (and long forms) and a
+     `gh pr|issue|release create|edit|comment|review|merge` `-b`/`--body`-style
+     option, and a `gh api` `-f`/`-F`/`--field`/`--raw-field`/`--input`, whose
+     text carries a Co-Authored-By trailer naming Claude or Anthropic, a
+     Claude-Session trailer, a "Generated with/by Claude Code" line or a
+     claude.ai/code session link. An `-F`/`--body-file`/`--notes-file` file is
+     read relative to the command's modeled cwd; `-F -` (stdin) and an
+     unreadable file are allowed.
 
 Commands are tokenized (quotes, escapes, comments and heredoc bodies handled;
 PowerShell escapes with a backtick, so its Windows paths keep their
@@ -76,6 +85,33 @@ HEREDOC_MESSAGE = (
     "~/.claude/CLAUDE.md). Heredocs that feed a program, like `python - <<'EOF'`, "
     "are fine.\n"
 )
+ATTRIBUTION_MESSAGE = (
+    "ATTRIBUTION BLOCKED by bash_guard hook: the {where} contains AI attribution "
+    "({snippet}). Remove Co-Authored-By trailers naming Claude or Anthropic, "
+    "\"Generated with Claude Code\" lines and claude.ai/code session links "
+    "(global rule in ~/.claude/CLAUDE.md).\n"
+)
+
+# A trailer line, a "Generated with/by Claude Code" line, or a claude.ai session
+# link, anywhere case-insensitive. The first two are anchored to a line start
+# (`re.MULTILINE`) so prose mentioning Claude mid-sentence never matches.
+ATTRIBUTION_PATTERNS = [
+    re.compile(r"(?im)^[ \t]*co-authored-by:[^\n]*\b(claude|anthropic)\b"),
+    re.compile(r"(?im)^[ \t]*co-authored-by:[^\n]*noreply@anthropic\.com"),
+    re.compile(r"(?im)^[ \t]*claude-session:"),
+    re.compile(r"(?i)generated (with|by) \[?claude code"),
+    re.compile(r"(?i)claude\.ai/code/session_"),
+]
+# git commit/merge options that carry message text: {name: "value" | "file"}.
+GIT_MESSAGE_OPTS = {"-m": "value", "--message": "value", "-F": "file", "--file": "file",
+                    "--trailer": "value"}
+GH_BODY_OPTS = {"-b": "value", "--body": "value", "-F": "file", "--body-file": "file"}
+GH_SUBJECT_OPTS = {"-t": "value", "--subject": "value"}
+GH_NOTES_OPTS = {"-n": "value", "--notes": "value", "-F": "file", "--notes-file": "file"}
+GH_PR_ACTIONS = {"create", "edit", "comment", "review", "merge"}
+GH_ISSUE_ACTIONS = {"create", "edit", "comment"}
+GH_RELEASE_ACTIONS = {"create", "edit"}
+GH_API_FIELD_FLAGS = ("-f", "-F", "--field", "--raw-field")
 
 
 def git(args, cwd, opts=()):
@@ -370,6 +406,167 @@ def herestring_file_write(cmd):
     return bool(PS_FILE_WRITE.search(PS_QUOTED.sub("''", HERESTRING.sub("@''@", cmd))))
 
 
+def read_file_text(cwd, path):
+    """`path`'s text, resolved from `cwd`; None for `-` (stdin) or an unreadable file."""
+    if path == "-":
+        return None
+    try:
+        with open(resolve(cwd, path), "r", encoding="utf-8", errors="replace") as f:
+            return f.read()
+    except OSError:
+        return None
+
+
+def attribution_match(text):
+    """The attribution line in `text`, trimmed to ~80 chars, else None."""
+    for pat in ATTRIBUTION_PATTERNS:
+        m = pat.search(text)
+        if m:
+            start = text.rfind("\n", 0, m.start()) + 1
+            end = text.find("\n", m.end())
+            line = text[start:len(text) if end < 0 else end].strip()
+            return line[:80].rstrip() + "..." if len(line) > 80 else line
+    return None
+
+
+def scan_options(cwd, args, spec):
+    """The text carried by options in `args` matching `spec` ({name: "value"|"file"}):
+    `-x val`, `-xval` (two-character names only), `--long val`, `--long=val`. A
+    `file` value of `-` (stdin) or an unreadable path yields nothing."""
+    i = 0
+    while i < len(args):
+        a = args[i]
+        val, step, kind = None, 1, None
+        for name, k in spec.items():
+            if a == name:
+                if i + 1 < len(args):
+                    val, step = args[i + 1], 2
+                kind = k
+                break
+            if len(name) == 2 and a.startswith(name) and a != name:
+                val, kind = a[len(name):], k
+                break
+            if name.startswith("--") and a.startswith(name + "="):
+                val, kind = a[len(name) + 1:], k
+                break
+        i += step
+        if val is None:
+            continue
+        if kind == "file":
+            if val != "-":
+                text = read_file_text(cwd, val)
+                if text is not None:
+                    yield text
+        else:
+            yield val
+
+
+def gh_api_texts(cwd, args):
+    """Field values from `gh api` `-f`/`-F`/`--field`/`--raw-field key=value` and
+    `--input <file>`; a `@file` value is read as a file, `@-` is stdin (allowed)."""
+    i = 0
+    while i < len(args):
+        a = args[i]
+        kv = None
+        if a in ("--input",) and i + 1 < len(args):
+            text = read_file_text(cwd, args[i + 1])
+            if text is not None:
+                yield text
+            i += 2
+            continue
+        if a.startswith("--input="):
+            text = read_file_text(cwd, a.split("=", 1)[1])
+            if text is not None:
+                yield text
+            i += 1
+            continue
+        if a in GH_API_FIELD_FLAGS and i + 1 < len(args):
+            kv, i = args[i + 1], i + 2
+        elif len(a) > 2 and a[:2] in ("-f", "-F"):
+            kv, i = a[2:], i + 1
+        elif a.startswith(("--field=", "--raw-field=")):
+            kv, i = a.split("=", 1)[1], i + 1
+        else:
+            i += 1
+            continue
+        _, sep, val = kv.partition("=")
+        if not sep:
+            continue
+        if val.startswith("@") and val != "@-":
+            text = read_file_text(cwd, val[1:])
+            if text is not None:
+                yield text
+        elif val != "@-":
+            yield val
+
+
+def git_subcommand(cwd, toks):
+    """(directory, subcommand, args after it) for a `git [global opts] <sub> ...`
+    call, else None. `-C` moves `cwd`; other global options are skipped."""
+    if os.path.basename(toks[0]).lower() not in ("git", "git.exe"):
+        return None
+    j = 1
+    while j < len(toks) and toks[j].startswith("-"):
+        t = toks[j]
+        if t in GIT_GLOBAL_WITH_ARG and j + 1 < len(toks):
+            if t == "-C":
+                cwd = resolve(cwd, toks[j + 1])
+            j += 2
+        else:
+            j += 1  # --no-pager, --bare, --git-dir=..., ...
+    if j < len(toks):
+        return cwd, toks[j].lower(), toks[j + 1:]
+    return None
+
+
+def gh_attribution_hit(cwd, seg):
+    """(where, matched line) if a `gh` call in `seg` carries AI attribution, else None."""
+    if len(seg) < 2:
+        return None
+    group = seg[1].lower()
+    if group == "api":
+        texts, where = gh_api_texts(cwd, seg[2:]), "gh api field value"
+    else:
+        if len(seg) < 3:
+            return None
+        action = seg[2].lower()
+        if group == "pr" and action in GH_PR_ACTIONS:
+            spec = dict(GH_BODY_OPTS)
+            if action == "merge":
+                spec.update(GH_SUBJECT_OPTS)
+            texts, where = scan_options(cwd, seg[3:], spec), "PR body"
+        elif group == "issue" and action in GH_ISSUE_ACTIONS:
+            texts, where = scan_options(cwd, seg[3:], GH_BODY_OPTS), "issue body"
+        elif group == "release" and action in GH_RELEASE_ACTIONS:
+            texts, where = scan_options(cwd, seg[3:], GH_NOTES_OPTS), "release notes"
+        else:
+            return None
+    for text in texts:
+        line = attribution_match(text)
+        if line:
+            return where, line
+    return None
+
+
+def attribution_hit(cwd, seg):
+    """(where, matched line) if `seg` carries AI attribution in a commit message
+    or PR/issue text, else None."""
+    name = os.path.basename(seg[0]).lower()
+    if name in ("git", "git.exe"):
+        call = git_subcommand(cwd, seg)
+        if call:
+            sub_cwd, sub, args = call
+            if sub in ("commit", "merge"):
+                for text in scan_options(sub_cwd, args, GIT_MESSAGE_OPTS):
+                    line = attribution_match(text)
+                    if line:
+                        return "commit message", line
+        return None
+    if name in ("gh", "gh.exe"):
+        return gh_attribution_hit(cwd, seg)
+    return None
+
+
 def main():
     try:
         data = json.load(sys.stdin)
@@ -381,15 +578,20 @@ def main():
         if heredoc_file_write(toks) or herestring_file_write(cmd):
             sys.stderr.write(HEREDOC_MESSAGE)
             return 2
-        if "push" not in cmd:
-            return 0
-        for cwd, seg in commands(toks, data.get("cwd") or os.getcwd(), powershell):
-            call = push_call(cwd, seg)
-            if call:
-                branch = push_target(*call)
-                if branch:
-                    sys.stderr.write(PUSH_MESSAGE.format(branch=branch))
-                    return 2
+        cwd0 = data.get("cwd") or os.getcwd()
+        for cwd, seg in commands(toks, cwd0, powershell):
+            hit = attribution_hit(cwd, seg)
+            if hit:
+                where, line = hit
+                sys.stderr.write(ATTRIBUTION_MESSAGE.format(where=where, snippet=line))
+                return 2
+            if "push" in cmd:
+                call = push_call(cwd, seg)
+                if call:
+                    branch = push_target(*call)
+                    if branch:
+                        sys.stderr.write(PUSH_MESSAGE.format(branch=branch))
+                        return 2
     except Exception:
         return 0  # fail open
     return 0

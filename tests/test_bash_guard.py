@@ -203,6 +203,86 @@ class HeredocGuardTest(unittest.TestCase):
             self.assertEqual(run_hook(cmd, self.cwd, tool="PowerShell"), (0, ""), cmd)
 
 
+class AttributionGuardTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.cwd = self.tmp.name
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def write(self, name, text):
+        path = os.path.join(self.cwd, name)
+        with open(path, "w", encoding="utf-8", newline="") as f:
+            f.write(text)
+        return path
+
+    def assertBlocked(self, command, cwd=None, tool="Bash"):
+        code, err = run_hook(command, cwd or self.cwd, tool)
+        self.assertEqual(code, 2, command)
+        self.assertIn("ATTRIBUTION BLOCKED", err, command)
+
+    def assertAllowed(self, command, cwd=None, tool="Bash"):
+        code, err = run_hook(command, cwd or self.cwd, tool)
+        self.assertEqual((code, err), (0, ""), command)
+
+    def test_dash_m_trailer_blocks(self):
+        self.assertBlocked('git commit -m "x\n\nCo-Authored-By: Claude <noreply@anthropic.com>"')
+
+    def test_dash_m_clean_message_passes(self):
+        self.assertAllowed('git commit -m "fix the thing"')
+
+    def test_dash_capital_f_file_with_trailer_blocks(self):
+        self.write("msg.txt", "Fix bug\n\nCo-Authored-By: Claude <noreply@anthropic.com>\n")
+        self.assertBlocked("git commit -F msg.txt")
+
+    def test_dash_capital_f_clean_file_passes(self):
+        self.write("msg.txt", "Fix bug\n\nCo-authored-by: Jane Doe <jane@example.com>\n")
+        self.assertAllowed("git commit -F msg.txt")
+
+    def test_trailer_flag_blocks(self):
+        self.assertBlocked('git commit -m "subject" --trailer "Co-authored-by: Claude <noreply@anthropic.com>"')
+
+    def test_gh_pr_create_body_file_generated_with_blocks(self):
+        self.write("body.md", "Adds the thing.\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n")
+        self.assertBlocked('gh pr create --title "t" --body-file body.md')
+
+    def test_gh_pr_edit_body_session_link_blocks(self):
+        self.assertBlocked('gh pr edit 1 --body "See notes. https://claude.ai/code/session_01AbC more text"')
+
+    def test_gh_api_field_value_blocks(self):
+        self.assertBlocked(
+            'gh api -X PATCH repos/o/r/pulls/1 -f "body=Fix the thing.\n\nCo-Authored-By: Claude <noreply@anthropic.com>"')
+
+    def test_gh_pr_merge_body_trailer_blocks(self):
+        self.assertBlocked('gh pr merge 1 --squash --body "Merge it.\n\nCo-Authored-By: Claude <noreply@anthropic.com>"')
+
+    def test_powershell_commit_trailer_blocks(self):
+        self.assertBlocked('git commit -m "x\n\nCo-Authored-By: Claude <noreply@anthropic.com>"', tool="PowerShell")
+
+    def test_echoed_command_text_passes(self):
+        self.assertAllowed("""echo "git commit -m 'Co-Authored-By: Claude'\"""")
+
+    def test_prose_mentions_pass(self):
+        self.assertAllowed('git commit -m "Not ported: the Claude review workflow"')
+        self.assertAllowed('git commit -m "Cleanup: drop the Co-Authored-By trailers that name Claude"')
+
+    def test_dash_capital_f_dash_stdin_passes(self):
+        self.assertAllowed("git commit -F -")
+
+    def test_missing_dash_capital_f_file_passes(self):
+        self.assertAllowed("git commit -F does-not-exist.txt")
+
+    def test_dash_capital_c_resolves_file_relative_to_target(self):
+        target = os.path.join(self.tmp.name, "repo")
+        os.makedirs(os.path.join(target, "rel"))
+        with open(os.path.join(target, "rel", "path"), "w", encoding="utf-8", newline="") as f:
+            f.write("Fix bug\n\nCo-Authored-By: Claude <noreply@anthropic.com>\n")
+        other = os.path.join(self.tmp.name, "elsewhere")
+        os.makedirs(other)
+        self.assertBlocked('git -C "%s" commit -F rel/path' % target, cwd=other)
+
+
 class FailOpenTest(unittest.TestCase):
     def test_bad_input_is_allowed(self):
         for payload in ("not json", "{}", json.dumps({"tool_input": {"command": ""}})):
