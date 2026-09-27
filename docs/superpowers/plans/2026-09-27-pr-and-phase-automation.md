@@ -66,6 +66,7 @@
 4. **`gh pr create` whose quoted body contains `-d` or `--draft`, or a compound command:** body text must not count as the draft flag. A separate `-d` token elsewhere in the command line may silence the hook, which is the safe side. Tests: `test_draft_word_inside_quoted_body_is_not_a_draft` and `test_compound_command` in Task 5.
 5. **A headless run that crashes with no `result` event, or hits a usage limit with no reset time:** autopilot stops with `error`, or sleeps the default 30 minutes. It never spins. Tests: `test_crash_without_result_stops_with_error` and `test_usage_limit_without_reset_time_uses_default` in Task 12.
 6. **A Windows PID at or above `2**31`:** it's a valid DWORD PID, so `pid_alive` must ask `OpenProcess`, not call it dead (cleanup would then delete a live session's checkout). The narrower `2**31 - 1` bound applies only to the POSIX `os.kill` path. Tests: `test_windows_high_pids_reach_open_process` and `test_posix_rejects_pids_past_the_signed_bound` in Task 1.
+7. **An autopilot run that corrects a Progress Log entry without adding one:** the log changed, so it isn't idle. The stalled check compares a content signature of the section (`progress_signature`), not its entry count. Tests: `test_progress_signature_tracks_the_log_content` in Task 10 and `test_a_rewritten_entry_counts_as_progress` in Task 12.
 
 ---
 
@@ -2679,7 +2680,7 @@ with:
 
 # Part E: overnight autopilot (PR 5, branch `feat/autopilot`)
 
-### Task 10: Handoff state reader (`scripts/handoff_state.py`: `autopilot_state`, `progress_count`, `status`)
+### Task 10: Handoff state reader (`scripts/handoff_state.py`: `autopilot_state`, `progress_signature`, `status`)
 
 **Files:**
 - Modify: `scripts/handoff_state.py`
@@ -2688,8 +2689,8 @@ with:
 **Interfaces:**
 - Produces:
   - `autopilot_state(path) -> "continue" | "owner" | "done" | None`: read from the first `Autopilot: <value>` line above the first `## ` heading. Case-insensitive. Returns None when the file or line is missing, or the value isn't exactly one of the three.
-  - `progress_count(path) -> int`: the number of `- ` lines in the Progress Log section.
-  - CLI `python handoff_state.py status FILE`: prints `{"exists": bool, "autopilot": str|null, "progress": int}` and exits 0.
+  - `progress_signature(path) -> str`: SHA-256 hex digest of the Progress Log section's content, normalized: trailing whitespace stripped from each line (so CRLF and LF match), blank lines dropped. It changes when an entry is added, removed or rewritten, even if the entry count stays the same. A missing file or section hashes as empty.
+  - CLI `python handoff_state.py status FILE`: prints `{"exists": bool, "autopilot": str|null, "progress": "<sha256 hex>"}` and exits 0.
 
 - [ ] **Step 1: Write the failing tests.** Add to `tests/test_handoff_state.py`, above the `if __name__` block (it reuses `hs` and `SCRIPT`):
 
@@ -2727,20 +2728,39 @@ class StateTest(unittest.TestCase):
         self.write("Autopilot: owner\n# H\n", newline="\r\n", bom=True)
         self.assertEqual(hs.autopilot_state(self.path), "owner")
 
-    def test_progress_count(self):
-        self.write("# H\n\n## Progress Log\n- a\n- b\n\n## Next\n- c\n")
-        self.assertEqual(hs.progress_count(self.path), 2)
-        self.assertEqual(hs.progress_count(os.path.join(self.tmp.name, "nope.md")), 0)
+    def signature(self, text, newline="\n"):
+        self.write(text, newline=newline)
+        return hs.progress_signature(self.path)
+
+    def test_progress_signature_tracks_the_log_content(self):
+        base = self.signature("# H\n\n## Progress Log\n- a\n- b\n\n## Next\n- c\n")
+        self.assertRegex(base, r"^[0-9a-f]{64}$")
+        # A rewritten entry changes the signature though the entry count stays 2.
+        self.assertNotEqual(self.signature("# H\n\n## Progress Log\n- a\n- b (fixed)\n\n## Next\n- c\n"), base)
+        self.assertNotEqual(self.signature("# H\n\n## Progress Log\n- a\n- b\n- c\n\n## Next\n- c\n"), base)
+        # Text outside the section, line endings and blank lines don't.
+        self.assertEqual(self.signature("# H2\n\n## Progress Log\n- a\n- b\n\n## Next\n- d\n"), base)
+        self.assertEqual(self.signature("# H\n\n## Progress Log\n- a\n- b\n\n## Next\n- c\n", "\r\n"), base)
+        self.assertEqual(self.signature("# H\n\n## Progress Log\n\n- a  \n- b\n\n\n## Next\n- c\n"), base)
+
+    def test_progress_signature_of_a_missing_file_or_section(self):
+        empty = self.signature("# H\n\n## Summary\n- a\n")
+        self.assertEqual(hs.progress_signature(os.path.join(self.tmp.name, "nope.md")), empty)
+        self.assertEqual(self.signature("# H\n\n## Progress Log\n"), empty)
+        self.assertNotEqual(self.signature("# H\n\n## Progress Log\n- a\n"), empty)
 
     def test_cli_status(self):
         self.write("# H\nAutopilot: continue\n\n## Progress Log\n- a\n")
         proc = subprocess.run([sys.executable, SCRIPT, "status", self.path], capture_output=True,
                               encoding="utf-8", timeout=30)
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertEqual(json.loads(proc.stdout), {"exists": True, "autopilot": "continue", "progress": 1})
-        proc = subprocess.run([sys.executable, SCRIPT, "status", self.path + ".x"], capture_output=True,
+        self.assertEqual(json.loads(proc.stdout), {"exists": True, "autopilot": "continue",
+                                                   "progress": hs.progress_signature(self.path)})
+        missing = self.path + ".x"
+        proc = subprocess.run([sys.executable, SCRIPT, "status", missing], capture_output=True,
                               encoding="utf-8", timeout=30)
-        self.assertEqual(json.loads(proc.stdout), {"exists": False, "autopilot": None, "progress": 0})
+        self.assertEqual(json.loads(proc.stdout), {"exists": False, "autopilot": None,
+                                                   "progress": hs.progress_signature(missing)})
 ```
 
 Add `import json` to the file's imports.
@@ -2748,8 +2768,8 @@ Add `import json` to the file's imports.
 - [ ] **Step 2: Run them to watch them fail.** Run `python -m unittest tests.test_handoff_state.StateTest -v`. Expected: `AttributeError: module 'handoff_state' has no attribute 'autopilot_state'`, and exit 2 from the CLI.
 
 - [ ] **Step 3: Implement.** In `scripts/handoff_state.py`:
-  - add `import json` and `import re`;
-  - extend the docstring's usage block with `python handoff_state.py status FILE   # JSON: exists, autopilot state, progress-line count`;
+  - add `import hashlib`, `import json` and `import re`;
+  - extend the docstring's usage block with `python handoff_state.py status FILE   # JSON: exists, autopilot state, Progress Log signature`;
   - add these below `append_progress`, and replace `main`:
 
 ```python
@@ -2771,16 +2791,18 @@ def autopilot_state(path):
     return None
 
 
-def progress_count(path):
-    """Number of `- ` entries in the Progress Log section."""
+def progress_signature(path):
+    """SHA-256 hex of the Progress Log section's non-blank lines, trailing whitespace stripped.
+    Content-based, so rewriting an entry counts as a change even when the entry count doesn't
+    move. A missing file or section hashes as empty."""
     lines, _ = _read(path)
-    count, in_log = 0, False
+    kept, in_log = [], False
     for line in lines:
         if line.startswith("## "):
             in_log = line.strip() == PROGRESS
-        elif in_log and line.startswith("- "):
-            count += 1
-    return count
+        elif in_log and line.strip():
+            kept.append(line.rstrip())
+    return hashlib.sha256("\n".join(kept).encode("utf-8")).hexdigest()
 
 
 def main(argv):
@@ -2789,7 +2811,7 @@ def main(argv):
         return 0
     if len(argv) == 2 and argv[0] == "status":
         print(json.dumps({"exists": os.path.isfile(argv[1]), "autopilot": autopilot_state(argv[1]),
-                          "progress": progress_count(argv[1])}))
+                          "progress": progress_signature(argv[1])}))
         return 0
     print("usage: handoff_state.py append FILE LINE | status FILE", file=sys.stderr)
     return 2
@@ -2797,7 +2819,7 @@ def main(argv):
 
 - [ ] **Step 4: Run the tests to watch them pass.** Run `python -m unittest tests.test_handoff_state -v`. Expected: all pass.
 
-- [ ] **Step 5: Commit.** Stage `scripts/handoff_state.py tests/test_handoff_state.py` and commit with the message `Read the handoff's Autopilot state and progress count`.
+- [ ] **Step 5: Commit.** Stage `scripts/handoff_state.py tests/test_handoff_state.py` and commit with the message `Read the handoff's Autopilot state and Progress Log signature`.
 
 ### Task 11: Stop guard, autopilot branch
 
@@ -2986,7 +3008,10 @@ count lives in FAKE_AUTOPILOT_COUNT). It then:
 3. prints the run's events as stream-json;
 4. exits with the run's code.
 
-A run: {"events": [...], "exit": 0, "commit": false, "progress": null | "- line", "autopilot": null | "done"}
+A run: {"events": [...], "exit": 0, "commit": false, "progress": null | "- line",
+        "rewrite": null | ["old text", "new text"], "autopilot": null | "done"}
+`rewrite` replaces the first occurrence of the old text in the handoff, e.g. to
+correct a Progress Log entry without adding one.
 Calls past the end of the list exit 1 with no output.
 """
 
@@ -3010,6 +3035,13 @@ def set_autopilot(value):
         f.write(data)
 
 
+def rewrite(old, new):
+    with open(HANDOFF, "rb") as f:
+        data = f.read()
+    with open(HANDOFF, "wb") as f:
+        f.write(data.replace(old.encode("utf-8"), new.encode("utf-8"), 1))
+
+
 def main(argv):
     with open(os.environ["FAKE_AUTOPILOT_RUNS"], encoding="utf-8") as f:
         runs = json.load(f)
@@ -3031,6 +3063,8 @@ def main(argv):
         subprocess.run(["git", "commit", "-q", "-m", "run %d" % n], check=True, capture_output=True)
     if run.get("progress"):
         handoff_state.append_progress(HANDOFF, run["progress"])
+    if run.get("rewrite"):
+        rewrite(*run["rewrite"])
     if run.get("autopilot"):
         set_autopilot(run["autopilot"])
     for event in run.get("events", []):
@@ -3078,9 +3112,9 @@ def result(cost=0.5, error=False, subtype="success", text="ok"):
             "result": text, "num_turns": 3}
 
 
-def run(events=None, commit=True, progress=None, autopilot=None, exit=0):
+def run(events=None, commit=True, progress=None, autopilot=None, exit=0, rewrite=None):
     return {"events": [result()] if events is None else events, "commit": commit, "progress": progress,
-            "autopilot": autopilot, "exit": exit}
+            "rewrite": rewrite, "autopilot": autopilot, "exit": exit}
 
 
 @unittest.skipUnless(PWSH, "needs PowerShell 7 (pwsh)")
@@ -3194,6 +3228,18 @@ class AutopilotTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertEqual(len(self.calls()), 3)
 
+    def test_a_rewritten_entry_counts_as_progress(self):
+        # Same entry count before and after each run, different content: not stalled.
+        with open(self.handoff, "a", encoding="utf-8") as f:
+            f.write("- one\n")
+        self.script(run(commit=False, rewrite=["- one", "- one (fixed)"]),
+                    run(commit=False, rewrite=["- one (fixed)", "- one (fixed again)"]),
+                    run(commit=False, autopilot="done"))
+        proc = self.autopilot()
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(len(self.calls()), 3)
+        self.assertRegex(self.last_line(), SUMMARY % ("done", 3, r"1\.50"))
+
     def test_budget_is_cumulative(self):
         self.script(run(events=[result(cost=20)]), run(events=[result(cost=6)]), run())
         proc = self.autopilot()
@@ -3291,7 +3337,9 @@ and -BudgetUsd dollars in all.
 
 It stops when:
 - the line says `owner` or `done`, or is missing;
-- two runs in a row change neither HEAD nor the Progress Log ("stalled");
+- two runs in a row change neither HEAD nor the Progress Log's content
+  ("stalled"; compared by `handoff_state.py status`'s content signature, so a
+  rewritten entry counts as a change);
 - the budget is spent;
 - a live Claude Code session is in the checkout.
 
@@ -3346,7 +3394,7 @@ function Write-Log([string]$Text) {
 
 function Get-HandoffState {
     $json = & python (Join-Path $Scripts 'handoff_state.py') status $Handoff
-    if ($LASTEXITCODE -ne 0) { return [pscustomobject]@{ exists = $false; autopilot = $null; progress = 0 } }
+    if ($LASTEXITCODE -ne 0) { return [pscustomobject]@{ exists = $false; autopilot = $null; progress = '' } }
     return (($json -join "`n") | ConvertFrom-Json)
 }
 
@@ -3428,7 +3476,7 @@ while ($true) {
     if (Test-LiveSession) { $status = 'live-session'; break }
 
     $headBefore = Get-Head
-    $progressBefore = $state.progress
+    $progressBefore = "$($state.progress)"   # Progress Log content signature, not an entry count
     $runs++
     Write-Log ('run {0} start {1}' -f $runs, (Get-Date -Format s))
     $run = Invoke-Run $remaining
@@ -3448,7 +3496,7 @@ while ($true) {
     }
 
     $after = Get-HandoffState
-    if ((Get-Head) -eq $headBefore -and $after.progress -eq $progressBefore) { $idle++ } else { $idle = 0 }
+    if ((Get-Head) -eq $headBefore -and "$($after.progress)" -ceq $progressBefore) { $idle++ } else { $idle = 0 }
     if ($idle -ge 2) { $status = 'stalled'; break }
 }
 

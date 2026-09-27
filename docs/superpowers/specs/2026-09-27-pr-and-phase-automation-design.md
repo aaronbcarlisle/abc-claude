@@ -164,7 +164,7 @@ Frontmatter: `model: opus`; tools Read, Grep, Glob, Write, Edit, Bash.
   2. Otherwise run `claude -p "/resume autopilot" --permission-mode auto --model <m> --max-turns <n> --max-budget-usd <remaining> --output-format stream-json --verbose`, with `CLAUDE_AUTOPILOT=1` in its environment, logging to `~/.claude/state/autopilot/<repo>-<yyyyMMdd-HHmm>.log`.
   3. Parse the final `result` event: `subtype`, `is_error`, `total_cost_usd`.
   4. On a usage or rate limit error, sleep until the reset time the error names, or 30 minutes when none is given, then continue.
-  5. Stop as "stalled" when two runs in a row leave HEAD and the Progress Log unchanged.
+  5. Stop as "stalled" when two runs in a row leave HEAD and the Progress Log unchanged. The log is compared by content (a hash of the section), not by entry count, so a run that only corrects an entry still counts as progress.
   6. The budget is cumulative across runs.
 - **End:** a summary line in the log and one appended to the handoff's Progress Log (status, runs, cost, last SHA).
 
