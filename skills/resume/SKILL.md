@@ -10,6 +10,7 @@ argument-hint: "[next task from the handoff's continuation prompt] | check"
 2. Read it in full. For its "Read These First" docs, read only the sections the next task needs (Grep, or Read with offsets), not whole large files. Read the `## Progress Log` last: its lines are newer than the body.
 3. Check the recorded state against reality:
    - `git status --short`, `git branch --show-current`, `git log --oneline -10`
+   - where the branch stands against the default branch: `git fetch -q`, then `git rev-list --left-right --count origin/main...HEAD` (`origin/master` where that is the default). Behind means merge it first if the work hits config or permission errors.
    - open PRs: `gh pr list --author @me` (skip without `gh` or a GitHub remote)
    - anything the handoff says is running (subagents, background jobs, test runs, servers): confirm it is actually alive. If it isn't, it needs re-dispatching.
 4. Report in 10 lines or fewer: phase, last completed task (with SHA), tests/gates status, open PRs, any drift between the handoff and reality, and the exact next step with its acceptance criteria. Text in `$ARGUMENTS` (other than `check`) is the owner's statement of the next task and wins where it differs from the file.
