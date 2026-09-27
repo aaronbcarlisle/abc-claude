@@ -331,6 +331,11 @@ class ShipLoopTest(unittest.TestCase):
                       body(skill("ship")))
         self.assertIn("pre-approved there only as `python -m unittest discover -s tests`, `npm test` or "
                       "`pnpm test`", section(body(skill("ship")), "## 2. Gates"))
+        # --test runs from the repo root: a bare `npm test` fits only a root package.json.
+        self.assertIn("whose `package.json` is at the root", phase6)
+        self.assertIn("keep Phase 2's `npm --prefix <dir> test`", phase6)
+        self.assertIn("a `package.json` only in a subfolder keeps the `npm --prefix <dir> test` form",
+                      section(body(skill("ship")), "## 2. Gates"))
         # The script's own help says the same about cmd.exe and quoting.
         script = body(os.path.join(REPO, "scripts", "post_merge_cleanup.py"))
         self.assertIn("(cmd.exe on Windows): quote with double quotes only", script)

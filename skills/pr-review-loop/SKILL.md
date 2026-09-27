@@ -266,7 +266,7 @@ All of these must hold:
 - the PR isn't a draft and has no `no-automerge` label. Otherwise report "auto-merge off: <draft | no-automerge>".
 - its base is the default branch. Otherwise report "stacked: run /finalize-stack".
 - `head` equals `git rev-parse HEAD` (nothing landed since the last check);
-- the checks query prints `0`;
+- the checks query prints `0`. If it instead fails with `no checks reported on the '<branch>' branch`, the repo runs no CI on this PR: count that as `0`. Any other failure is a failed query: run it once more, and if it fails again report "blocked: checks query failed".
 - `threads.sh` exits 0 and prints nothing. A non-zero exit is a failed query, not "no threads": run it once more, and if it fails again report "blocked: review threads query failed".
 - no item in this loop's task list is waiting on the owner;
 - the last Phase 4 wait didn't print `review status unknown`. Otherwise report "blocked: review status unknown (gh query failed)".
@@ -280,7 +280,7 @@ To tell pending checks from failing ones, drop `| length` from the checks query:
 
 If a condition fails otherwise:
 - **The loop can fix it** (`head` moved, new unresolved threads, a failing check): go back to Phase 1.
-- **Only the owner can resolve it** (draft or `no-automerge`, stacked, a failed threads query, an item waiting on the owner, review status unknown, a merge state that isn't `CLEAN` with no checks pending): report it and stop without merging.
+- **Only the owner can resolve it** (draft or `no-automerge`, stacked, a failed threads or checks query, an item waiting on the owner, review status unknown, a merge state that isn't `CLEAN` with no checks pending): report it and stop without merging.
 
 Merge only once every condition holds and no check is pending:
 ```bash
@@ -294,14 +294,14 @@ If it prints nothing or `null`, the merge isn't confirmed: report that and stop 
 
 Then run the cleanup. Run it from this session's checkout: `--repo .` and `--here` both follow the current directory, and the handoff line goes to that checkout's SESSION_HANDOFF.md, when it has one. Pick the command that fits the gate test command:
 - a `tests/test_*.py` suite: `POST_MERGE_TEST_TIMEOUT=540 python "$HOME/.claude/scripts/post_merge_cleanup.py" --repo . --here --test 'python -m unittest discover -s tests'`
-- a `package.json` repo whose test gate is its `test` script: `POST_MERGE_TEST_TIMEOUT=540 python "$HOME/.claude/scripts/post_merge_cleanup.py" --repo . --here --test 'npm test'`, or with pnpm `POST_MERGE_TEST_TIMEOUT=540 python "$HOME/.claude/scripts/post_merge_cleanup.py" --repo . --here --test 'pnpm test'`
+- a repo whose `package.json` is at the root and whose test gate is its `test` script: `POST_MERGE_TEST_TIMEOUT=540 python "$HOME/.claude/scripts/post_merge_cleanup.py" --repo . --here --test 'npm test'`, or with pnpm `POST_MERGE_TEST_TIMEOUT=540 python "$HOME/.claude/scripts/post_merge_cleanup.py" --repo . --here --test 'pnpm test'`
 - no test command: `POST_MERGE_TEST_TIMEOUT=540 python "$HOME/.claude/scripts/post_merge_cleanup.py" --repo . --here`
 
 Only these exact commands are pre-approved: a Claude Code allow rule without `*` matches one exact command, and the script runs `--test` through a shell, so no rule may leave it open. Any other gate test command still works, passed the same way as `--test '<gate test command>'` after `--here`, but that run goes through the normal permission check.
 
 Run the cleanup with the Bash tool's `timeout: 600000`. If it still moves to the background, wait for its completion notification; never start a second run.
 
-`<gate test command>` is the test command from Phase 2 step 4's discovery (the same one /ship's gates used; a test command in CLAUDE.md or AGENTS.md wins). Pass it single-quoted in Bash. Inside it use double quotes only, because on Windows the script runs it through cmd.exe: no `$VAR`, `'…'`, `~` or `2>/dev/null`. Don't wrap it in `bash -c` and don't switch shells. For a repo whose only tests are `tests/test_*.py`, that's `--test 'python -m unittest discover -s tests'`, which is already safe. For a `package.json` repo whose test gate is its `test` script, pass `--test 'npm test'` or `--test 'pnpm test'`, not Phase 2's `npm --prefix`/`pnpm --dir` form, so the run stays pre-approved. Omit `--test` when the repo has no test command.
+`<gate test command>` is the test command from Phase 2 step 4's discovery (the same one /ship's gates used; a test command in CLAUDE.md or AGENTS.md wins). Pass it single-quoted in Bash. Inside it use double quotes only, because on Windows the script runs it through cmd.exe: no `$VAR`, `'…'`, `~` or `2>/dev/null`. Don't wrap it in `bash -c` and don't switch shells. For a repo whose only tests are `tests/test_*.py`, that's `--test 'python -m unittest discover -s tests'`, which is already safe. For a repo whose `package.json` is at the root and whose test gate is its `test` script, pass `--test 'npm test'` or `--test 'pnpm test'`, not Phase 2's `npm --prefix`/`pnpm --dir` form, so the run stays pre-approved. The script runs `--test` from the repo root, so when the only `package.json` is in a subfolder, keep Phase 2's `npm --prefix <dir> test` (or `pnpm --dir <dir> test`) form: a bare `npm test` would fail there and report a false `tests: fail`. Omit `--test` when the repo has no test command.
 
 Reading the cleanup's exit code and output:
 - Report the merge SHA and the cleanup output.

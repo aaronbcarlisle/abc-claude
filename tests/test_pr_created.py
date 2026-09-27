@@ -80,6 +80,10 @@ class PrCreatedTest(unittest.TestCase):
         for flag in ("--draft", "-d", "--draft=true"):
             self.assertIsNone(self.run_hook(command="gh pr create %s --title T" % flag), flag)
 
+    def test_draft_flag_of_another_command_is_not_a_draft(self):
+        self.assertShip(self.run_hook(command="git branch -d old && gh pr create --title T --body B"))
+        self.assertIsNone(self.run_hook(command="git push && gh pr create -d --title T"))
+
     def test_draft_word_inside_quoted_body_is_not_a_draft(self):
         self.assertShip(self.run_hook(command='gh pr create --title T --body "use -d or --draft next time"'))
 

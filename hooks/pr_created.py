@@ -41,12 +41,28 @@ def state_dir():
         os.path.expanduser("~"), ".claude", "state", "ship")
 
 
-def is_draft(command):
+def create_args(command):
+    """The words of the `gh pr create` invocation, up to the next shell separator, so a `-d` from
+    another command in the same call (`git branch -d old && gh pr create ...`) doesn't count."""
     try:
-        words = shlex.split(command, posix=True)
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
+        lexer.whitespace_split = True
+        words = list(lexer)
     except ValueError:
         words = command.split()
-    return any(w in ("--draft", "-d") or w.startswith("--draft=") for w in words)
+    for i in range(len(words) - 2):
+        if words[i:i + 3] == ["gh", "pr", "create"]:
+            args = []
+            for w in words[i + 3:]:
+                if w and all(c in "&|;()" for c in w):
+                    break
+                args.append(w)
+            return args
+    return words  # no clean `gh pr create` split: check every word, as before
+
+
+def is_draft(command):
+    return any(w in ("--draft", "-d") or w.startswith("--draft=") for w in create_args(command))
 
 
 def output(response):
