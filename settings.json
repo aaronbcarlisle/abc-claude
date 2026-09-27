@@ -18,8 +18,6 @@
     "anthropic-skills:xlsx": "off",
     "anthropic-skills:morning": "off",
     "anthropic-skills:import-memory": "off",
-    "cleanup": "off",
-    "doc-audit": "off",
     "anthropic-skills:docs": "off",
     "anthropic-skills:pdf": "off"
   },
@@ -61,7 +59,6 @@
     "claude-opus-5": {
       "effortLevel": "high"
     },
-    "claude-fable-5-1": {},
     "claude-opus-5-5": {
       "effortLevel": "high"
     }
