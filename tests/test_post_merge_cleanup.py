@@ -483,6 +483,18 @@ class RefusalTest(CleanupCase):
         self.assertEqual(code, 0, r)
         self.assertEqual(self.deleted(r), {"feat/a"})
 
+    def test_here_in_main_checkout_with_a_second_live_session_skips_it(self):
+        self.pushed_branch("feat/a")
+        self.squash_merge("feat/a", 1)
+        git(self.work, self.env, "switch", "-q", "feat/a")
+        self.live_session(self.work)
+        self.live_session(self.work)
+        code, r = self.cleanup("--here")
+        self.assertEqual(code, 0, r)
+        self.assertEqual(self.current(), "feat/a")
+        self.assertIn("live session", self.kept(r)["feat/a"])
+        self.assertIs(r["pulled"], False)
+
     def test_dirty_main_checkout_refuses_without_here(self):
         with open(os.path.join(self.work, "README.md"), "a", encoding="utf-8") as f:
             f.write("edit\n")

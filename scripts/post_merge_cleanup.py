@@ -221,7 +221,8 @@ def cleanup(args, report):
     report["repo"] = repo
     paths = [t["path"] for t in trees]
     here = live_sessions.owner(os.getcwd(), paths) if args.here else None
-    live = {c: s for c, s in live_sessions.live_checkouts(paths).items() if c != here}
+    # --here exempts one session (the caller's) in its own checkout, not every session there.
+    live = {c: s for c, s in live_sessions.live_checkouts(paths).items() if c != here or len(s) > 1}
     main_live = ", ".join(str(s["pid"]) for s in live.get(repo, []))
     if main_live and not args.here:
         raise Refused("a live Claude Code session is in the main checkout (pid %s)" % main_live)
