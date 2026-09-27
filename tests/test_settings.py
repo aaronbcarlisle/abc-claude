@@ -38,6 +38,10 @@ class SettingsTest(unittest.TestCase):
         for matcher, _ in found:
             self.assertEqual(matcher, "Bash|PowerShell")
 
+    def test_stop_guard_runs_on_stop(self):
+        commands = [h["command"] for _, h in self.handlers("Stop")]
+        self.assertTrue(any("stop_guard.py" in c for c in commands), commands)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
