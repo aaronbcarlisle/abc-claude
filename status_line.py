@@ -144,9 +144,9 @@ def context_section(context_window):
     """'312k/1M' — tokens in the context window, colored by absolute size."""
     tokens = context_window.get("total_input_tokens")
     size = context_window.get("context_window_size")
-    if not tokens:
+    if tokens is None:
         pct = context_window.get("used_percentage")
-        return paint(f"{int(pct)}%", DIM) if pct else None
+        return paint(f"{int(pct)}%", DIM) if pct is not None else None
 
     if tokens < CONTEXT_PLAN:
         color = DIM

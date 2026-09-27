@@ -64,5 +64,22 @@ class LimitsTest(unittest.TestCase):
         self.assertNotIn("5h", ANSI.sub("", render(BASE)))
 
 
+class ContextTest(unittest.TestCase):
+    def test_tokens_and_size(self):
+        out = sl.context_section({"total_input_tokens": 312_400, "context_window_size": 1_000_000})
+        self.assertEqual(ANSI.sub("", out), "312k/1M")
+
+    def test_zero_tokens_is_shown(self):
+        out = sl.context_section({"total_input_tokens": 0, "context_window_size": 1_000_000})
+        self.assertEqual(ANSI.sub("", out), "0/1M")
+
+    def test_percentage_fallback_shows_zero(self):
+        self.assertEqual(ANSI.sub("", sl.context_section({"used_percentage": 0})), "0%")
+        self.assertEqual(ANSI.sub("", sl.context_section({"used_percentage": 37.6})), "37%")
+
+    def test_hidden_when_absent(self):
+        self.assertIsNone(sl.context_section({}))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
