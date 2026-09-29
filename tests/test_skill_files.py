@@ -588,5 +588,76 @@ class ShipLoopTest(unittest.TestCase):
         self.assertIn("Open PRs with `/ship`", body(os.path.join(REPO, "CLAUDE.md")))
 
 
+class FinalizeStackTest(unittest.TestCase):
+    def test_owner_invoked_only(self):
+        self.assertEqual(frontmatter(skill("finalize-stack")).get("disable-model-invocation"), "true")
+
+    def test_allows_the_tools_it_uses(self):
+        # AskUserQuestion: picking a chain and batching owner rulings; Skill: `/handoff log`.
+        allowed = frontmatter(skill("finalize-stack")).get("allowed-tools", [])
+        for tool in ("AskUserQuestion", "Agent", "Skill", "Monitor"):
+            self.assertIn(tool, allowed, tool)
+
+    def test_pre_approves_no_shell_or_interpreter(self):
+        allowed = frontmatter(skill("finalize-stack")).get("allowed-tools", [])
+        for rule in ("Bash(python:*)", "Bash(bash:*)"):
+            self.assertNotIn(rule, allowed, rule)
+        for rule in allowed:
+            if "post_merge_cleanup.py" in rule:
+                self.assertNotIn("*", rule, rule)
+        for rule in CLEANUP_RULES:
+            self.assertIn(rule, allowed, rule)
+        threads = 'Bash(bash "$HOME/.claude/skills/pr-review-loop/scripts/threads.sh" *)'
+        live = 'Bash(python "$HOME/.claude/scripts/live_sessions.py" *)'
+        self.assertIn(threads, allowed)
+        self.assertIn(live, allowed)
+        self.assertTrue(rule_matches(threads, 'bash "$HOME/.claude/skills/pr-review-loop/scripts/threads.sh" 12'))
+        self.assertTrue(rule_matches(live, 'python "$HOME/.claude/scripts/live_sessions.py" ../repo-s2'))
+        text = body(skill("finalize-stack"))
+        self.assertIn('bash "$HOME/.claude/skills/pr-review-loop/scripts/threads.sh" <N>', text)
+        self.assertNotIn("CLAUDE_SKILL_DIR", text)
+        self.assertIn("go through the normal permission check", text)
+
+    def test_force_pushes_only_with_lease_and_merges_bottom_up(self):
+        text = body(skill("finalize-stack"))
+        self.assertIn("--force-with-lease", text)
+        self.assertNotRegex(text, r"--force(?!-with-lease)")
+        self.assertIn("git rebase --update-refs", text)
+        self.assertIn("gh pr merge --squash --match-head-commit <head> <N>", text)
+        self.assertIn("post_merge_cleanup.py", text)
+
+    def test_reuses_a_checkout_that_already_holds_a_stack_branch(self):
+        # `git worktree add <path> <branch>` fails when <branch> is checked out anywhere, e.g. when
+        # the top branch is the current branch of the checkout /finalize-stack runs from.
+        text = body(skill("finalize-stack"))
+        self.assertIn("git worktree list --porcelain", text)
+        self.assertIn("the top branch is this checkout's current branch", text)
+        self.assertIn("git -C <path> status --porcelain --untracked-files=no", text)
+        self.assertIn("with uncommitted changes; commit or stash them there", text)
+        self.assertIn("In every PR's checkout except the top PR's, run `git switch --detach`", text)
+
+    def test_stops_on_unconfirmed_state_and_never_sleeps_in_the_foreground(self):
+        text = body(skill("finalize-stack"))
+        for needle in ("--match-head-commit", "feedback query failed", "reviews still pending",
+                       "<triage-time>", "timeout_ms: 180000", "blocked: review threads query failed",
+                       "blocked: checks query failed", "head moved on #<N>: re-run /finalize-stack",
+                       "new feedback on #<N> since triage: re-run /finalize-stack",
+                       "--json mergeCommit --jq .mergeCommit.oid",
+                       "no checks reported on the '<branch>' branch"):
+            self.assertIn(needle, text, needle)
+        sleeping = [line for line in text.splitlines() if re.search(r"\bsleep\b", line)]
+        self.assertEqual(len(sleeping), 1, sleeping)
+        self.assertTrue(sleeping[0].strip().startswith("for i in 1 2 3; do sleep 30;"), sleeping)
+
+    def test_cleanup_runs_from_the_checkout_with_an_exact_command(self):
+        cleanup = section(body(skill("finalize-stack")), "## 6. Cleanup")
+        self.assertIn("timeout: 600000", cleanup)
+        self.assertIn("never start a second run", cleanup)
+        self.assertIn("--test '<gate test command>'", cleanup)
+        self.assertIn("no `$VAR`, `'…'`, `~` or `2>/dev/null`", cleanup)
+        for rule in CLEANUP_RULES:
+            self.assertIn(rule[len("Bash("):-1], cleanup, rule)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
