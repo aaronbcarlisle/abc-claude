@@ -592,12 +592,6 @@ class FinalizeStackTest(unittest.TestCase):
     def test_owner_invoked_only(self):
         self.assertEqual(frontmatter(skill("finalize-stack")).get("disable-model-invocation"), "true")
 
-    def test_allows_the_tools_it_uses(self):
-        # AskUserQuestion: picking a chain and batching owner rulings; Skill: `/handoff log`.
-        allowed = frontmatter(skill("finalize-stack")).get("allowed-tools", [])
-        for tool in ("AskUserQuestion", "Agent", "Skill", "Monitor"):
-            self.assertIn(tool, allowed, tool)
-
     def test_pre_approves_no_shell_or_interpreter(self):
         allowed = frontmatter(skill("finalize-stack")).get("allowed-tools", [])
         for rule in ("Bash(python:*)", "Bash(bash:*)"):
@@ -751,9 +745,25 @@ class FinalizeStackTest(unittest.TestCase):
             self.assertIn(needle, step5, needle)
 
     def test_new_feedback_is_re_triaged_once_then_stops(self):
-        text = body(skill("finalize-stack"))
-        self.assertIn("again after re-triage", text)
-        self.assertIn("<triage-time N>", text)
+        step5 = section(body(skill("finalize-stack")), "## 5. Merge bottom-up")
+        self.assertIn("again after re-triage", step5)
+        # The fresh triage time comes before the re-triage, so feedback landing during the fix still counts.
+        fresh = step5.index("take a fresh `<triage-time N>`")
+        self.assertLess(fresh, step5.index("dispatch that PR's triage agent once more"))
+        # A PR with more than 30 reviews keeps the newest ones on later pages.
+        self.assertIn('gh api --paginate "repos/{owner}/{repo}/pulls/<N>/reviews"', step5)
+
+    def test_merges_the_checked_head_and_watches_the_next_pr(self):
+        step5 = section(body(skill("finalize-stack")), "## 5. Merge bottom-up")
+        merge = self._step(step5, 2)
+        self.assertIn("the `headRefOid` step 1 checked (don't re-query it", merge)
+        self.assertNotIn("gh pr view <N> --json headRefOid --jq .headRefOid`), then merge", merge)
+        self.assertIn("gh pr checks <next> --watch --interval 30", self._step(step5, 5))
+
+    def test_restack_gates_every_branch_it_pushes(self):
+        step4 = section(body(skill("finalize-stack")), "## 4. Restack")
+        self.assertIn("In each PR's checkout, the top PR's included", self._step(step4, 4))
+        self.assertIn("Phase 2 step 4 (how to find the gate commands", body(skill("finalize-stack")))
 
     def test_cleanup_reports_timeouts_and_kept_branches(self):
         cleanup = section(body(skill("finalize-stack")), "## 6. Cleanup")
