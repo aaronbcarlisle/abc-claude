@@ -452,8 +452,11 @@ class ShipLoopTest(unittest.TestCase):
                 ("`post-merge cleanup failed: <error>`", '"post-merge cleanup failed: "'),
                 ("`tests: skipped`", '"tests": "skipped"'),
                 ("`note:`", '"note: "'),
-                ("`checked out in this session's worktree`",
-                 "checked out in this session's worktree: remove it after this session ends")):
+                ("`checked out in this session's worktree, which has uncommitted changes`",
+                 "checked out in this session's worktree, which has uncommitted changes"),
+                ("`detach of this session's worktree failed: <error>`",
+                 "detach of this session's worktree failed: %s"),
+                ("start the next branch with `git switch -c`", "start the next branch with git switch -c")):
             self.assertIn(skill_text, phase6)
             self.assertIn(script_text, script)
         self.assertIn("Exit 1:", phase6)

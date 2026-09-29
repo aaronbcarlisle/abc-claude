@@ -338,9 +338,104 @@ class WorktreeTest(CleanupCase):
         self.live_session(path)
         code, r = self.cleanup("--here", cwd=path)
         self.assertEqual(code, 0, r)
-        self.assertIn("after this session ends", self.kept(r)["feat/a"])
-        self.assertEqual(self.deleted(r), {"feat/b"})
+        self.assertEqual(self.deleted(r), {"feat/a", "feat/b"})
         self.assertTrue(os.path.exists(path))
+        self.assertEqual(self.detached_at(path), git(self.work, self.env, "rev-parse", "origin/main"))
+        self.assertFalse(self.branch_exists("feat/a"))
+        self.assertTrue(any("is now detached at origin/main" in n and "git switch -c" in n
+                            for n in r["notes"]), r["notes"])
+
+    def detached_at(self, path):
+        """The SHA HEAD points at in `path`, or None when HEAD is on a branch."""
+        head = subprocess.run(["git", "symbolic-ref", "-q", "HEAD"], cwd=path, env=self.env,
+                              capture_output=True, encoding="utf-8")
+        return None if head.returncode == 0 else git(path, self.env, "rev-parse", "HEAD")
+
+    def branch_exists(self, branch):
+        return subprocess.run(["git", "show-ref", "--verify", "--quiet", "refs/heads/" + branch],
+                              cwd=self.work, env=self.env).returncode == 0
+
+    def here_worktree(self):
+        """A merged branch feat/a in a clean worktree that the caller runs in; feat/b merged too."""
+        self.pushed_branch("feat/a")
+        path = self.worktree("wt-a", "feat/a")
+        self.pushed_branch("feat/b")
+        self.squash_merge("feat/a", 1)
+        self.squash_merge("feat/b", 2)
+        return path
+
+    def test_here_keeps_a_worktree_with_tracked_changes(self):
+        path = self.here_worktree()
+        self.write(path, "f1.txt", "edited\n")
+        self.live_session(path)
+        code, r = self.cleanup("--here", cwd=path)
+        self.assertEqual(code, 0, r)
+        self.assertEqual(self.kept(r)["feat/a"],
+                         "checked out in this session's worktree, which has uncommitted changes")
+        self.assertNotIn("feat/a", self.deleted(r))
+        self.assertIsNone(self.detached_at(path))
+        self.assertTrue(self.branch_exists("feat/a"))
+
+    def test_here_keeps_a_worktree_with_a_second_live_session(self):
+        path = self.here_worktree()
+        self.live_session(path)
+        self.live_session(path)
+        code, r = self.cleanup("--here", cwd=path)
+        self.assertEqual(code, 0, r)
+        self.assertIn("live session", self.kept(r)["feat/a"])
+        self.assertIsNone(self.detached_at(path))
+        self.assertTrue(self.branch_exists("feat/a"))
+
+    def test_here_dry_run_reports_the_deletion_and_changes_nothing(self):
+        path = self.here_worktree()
+        self.live_session(path)
+        code, r = self.cleanup("--here", "--dry-run", cwd=path)
+        self.assertEqual(code, 0, r)
+        self.assertIn("feat/a", self.deleted(r))
+        self.assertFalse(any("now detached" in n for n in r["notes"]), r["notes"])
+        self.assertIsNone(self.detached_at(path))
+        self.assertTrue(self.branch_exists("feat/a"))
+
+    def test_here_carries_untracked_files_through_the_detach(self):
+        path = self.here_worktree()
+        self.write(path, "scratch/notes.txt", "mine\n")
+        self.live_session(path)
+        code, r = self.cleanup("--here", cwd=path)
+        self.assertEqual(code, 0, r)
+        self.assertIn("feat/a", self.deleted(r))
+        self.assertIsNotNone(self.detached_at(path))
+        with open(os.path.join(path, "scratch", "notes.txt"), encoding="utf-8") as f:
+            self.assertEqual(f.read(), "mine\n")
+
+    def test_here_keeps_the_branch_when_the_detach_fails(self):
+        path = self.here_worktree()
+        # origin/main tracks f2.txt (from feat/b); an untracked copy would be overwritten.
+        self.write(path, "f2.txt", "in the way\n")
+        self.live_session(path)
+        code, r = self.cleanup("--here", cwd=path)
+        self.assertEqual(code, 0, r)
+        self.assertTrue(self.kept(r)["feat/a"].startswith("detach of this session's worktree failed: "),
+                        self.kept(r))
+        self.assertNotIn("feat/a", self.deleted(r))
+        self.assertIsNone(self.detached_at(path))
+        self.assertTrue(self.branch_exists("feat/a"))
+
+    def test_here_detach_never_overwrites_an_ignored_file(self):
+        # `git switch` overwrites ignored files by default; an ignored .env or handoff at a path
+        # origin/main tracks must make the detach fail instead.
+        path = self.here_worktree()
+        common = git(path, self.env, "rev-parse", "--path-format=absolute", "--git-common-dir").strip()
+        with open(os.path.join(common, "info", "exclude"), "a", encoding="utf-8") as f:
+            f.write("f2.txt\n")
+        self.write(path, "f2.txt", "ignored and precious\n")
+        self.live_session(path)
+        code, r = self.cleanup("--here", cwd=path)
+        self.assertEqual(code, 0, r)
+        self.assertTrue(self.kept(r)["feat/a"].startswith("detach of this session's worktree failed: "),
+                        self.kept(r))
+        with open(os.path.join(path, "f2.txt"), encoding="utf-8") as f:
+            self.assertEqual(f.read(), "ignored and precious\n")
+        self.assertTrue(self.branch_exists("feat/a"))
 
     def test_ignored_session_files_keep_the_worktree(self):
         # `git worktree remove` deletes ignored files, so an ignored handoff, SDD

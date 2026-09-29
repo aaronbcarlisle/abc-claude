@@ -16,8 +16,12 @@ default or has none) is kept unless a merged PR contains its tip: it's new
 work that hasn't started. Checkouts with a live Claude Code session are
 skipped; --here exempts the caller's own checkout. A live main checkout
 refuses the run, unless --here, which skips it instead: no switch, pull or
-tests there. A worktree is removed only when it has no uncommitted or
-untracked files and no ignored session files (a handoff, .superpowers/, .env).
+tests there. The caller's own worktree is never removed (a session can't
+remove the worktree it runs in), but when it has no tracked uncommitted
+changes and no other live session, it is detached at origin/<default> and
+its merged branch is deleted; otherwise the branch is kept. Any other
+worktree is removed only when it has no uncommitted or untracked files and
+no ignored session files (a handoff, .superpowers/, .env).
 A failed switch or delete keeps that branch and the run goes on. Never
 commits and never pushes. --dry-run changes nothing (not even a fetch).
 
@@ -127,7 +131,7 @@ def worktrees(repo):
 
 
 def dirty(path):
-    """True when the main checkout at `path` has tracked changes; untracked files don't count."""
+    """True when the checkout at `path` has tracked changes; untracked files don't count."""
     return bool(git(path, "status", "--porcelain", "--untracked-files=no"))
 
 
@@ -282,13 +286,27 @@ def cleanup(args, report):
                     keep("checked out in the main checkout, which has uncommitted changes")
                     continue
                 if not args.dry_run:
-                    switched = run(["git", "switch", "--quiet", default], repo, check=False)
+                    # git switch overwrites ignored files by default (a .env, a handoff): refuse instead.
+                    switched = run(["git", "switch", "--quiet", "--no-overwrite-ignore", default], repo, check=False)
                     if switched.returncode != 0:
                         keep("switch to %s failed: %s" % (default, switched.stderr.strip()))
                         continue
             elif path == here:
-                keep("checked out in this session's worktree: remove it after this session ends")
-                continue
+                # A session can't remove the worktree it runs in, so detach it and drop the branch.
+                if path in live:
+                    keep("worktree %s has a live session" % path)
+                    continue
+                if dirty(path):
+                    keep("checked out in this session's worktree, which has uncommitted changes")
+                    continue
+                if not args.dry_run:
+                    detached = run(["git", "switch", "--detach", "--quiet", "--no-overwrite-ignore", target],
+                                   path, check=False)
+                    if detached.returncode != 0:
+                        keep("detach of this session's worktree failed: %s" % detached.stderr.strip())
+                        continue
+                    notes.append("this session's worktree %s is now detached at origin/%s: "
+                                 "start the next branch with git switch -c" % (path, default))
             elif path in live:
                 keep("worktree %s has a live session" % path)
                 continue
