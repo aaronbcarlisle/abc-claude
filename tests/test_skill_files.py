@@ -798,12 +798,16 @@ class AutopilotSkillsTest(unittest.TestCase):
         for state in ("`continue`", "`owner`", "`done`"):
             self.assertIn(state, text)
         self.assertIn("owner checklist", text)
+        self.assertIn("nothing else on the line", text)
+        self.assertIn("owner gate:", text)
 
     def test_resume_has_a_headless_autopilot_mode(self):
         self.assertIn("autopilot", frontmatter(skill("resume")).get("argument-hint", ""))
         text = body(skill("resume"))
         self.assertIn("never stop to ask", text)
         self.assertIn("`Autopilot: owner`", text)
+        self.assertIn("Autopilot: done", text)
+        self.assertIn("/handoff log", text)
 
 
 class AgentFilesTest(unittest.TestCase):

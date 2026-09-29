@@ -37,7 +37,7 @@ Whole-file rewrite, sections in this order:
 | Section | Contents |
 |---|---|
 | `# Session Handoff — <date>` | Plus a short parenthetical on what closed, e.g. `(Task 7.5 closed)` |
-| `Autopilot: <state>` | One line directly under the title. `continue` when the next task needs no owner input; `owner` when the next step is an owner gate; `done` when the phase is complete. `scripts/autopilot.ps1` reads it and runs only on `continue`. |
+| `Autopilot: <state>` | One line directly under the title. `continue` when the next task needs no owner input; `owner` when the next step is an owner gate; `done` when the phase is complete. The line is exactly `Autopilot: continue`, `Autopilot: owner` or `Autopilot: done`: plain text, with no backticks, bold or trailing words, and nothing else on the line. Otherwise `scripts/autopilot.ps1` reads it as missing and stops. A focus note starting `owner gate:` means `owner`. `scripts/autopilot.ps1` reads it and runs only on `continue`. |
 | `## Summary` | 3–5 sentences. Lead with the single most important thing a newcomer must know, especially if it **overturns** something previously believed. |
 | `## Task Context` | Original request verbatim-ish, current status, repo path, branch, remote, open PRs. |
 | `## Read These First` | Numbered, in reading order, with one line on why each matters. Name the binding authority. |
