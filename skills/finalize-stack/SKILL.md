@@ -45,7 +45,9 @@ Stop cases: whenever this skill says to stop, report why and stop. Don't restack
 A chain starts at a PR whose base is the default branch, or whose base is a branch whose PR is already merged (that merged PR is the chain's "squash-merged bottom": find it with `gh pr view <base branch> --json number,state,headRefOid`, which accepts a branch name); each next PR's base is the previous PR's head branch. Build every chain from "My open PRs".
 - `#N` in the arguments picks the chain holding it.
 - With more than one chain and none picked, ask which (AskUserQuestion).
-- A draft in the chain: ask whether to include it.
+- A draft, or a PR labelled `no-automerge`, in the chain: ask whether to include it (both opt out of auto-merge; the owner's yes opts it back in for this run). Batch the question if there are several.
+  - Included: before step 2, run `gh pr ready <N>` for a draft and `gh pr edit <N> --remove-label no-automerge` for the label. A failure stops with "could not include #<N>: <error>".
+  - Left out: the chain ends just below it. If it's the bottom PR, stop with "nothing to finalize: #<N> is left out".
 
 Print the map:
 ```
@@ -112,15 +114,15 @@ Collect every `needs_owner` item across the stack and ask them in one batch: Ask
 ## 5. Merge bottom-up
 For the bottom PR, whose base is the default branch:
 1. Check, fresh, right before the merge:
-   - **State:** `gh pr view <N> --json isDraft,baseRefName,headRefOid,mergeStateStatus`. `baseRefName` must equal `<default>` and `isDraft` must be false; otherwise stop with "#<N> base is <base>, not <default>" or "#<N> is a draft". `headRefOid` must equal the SHA this run last pushed for that branch, or its `<pre-triage tip N>` if it was never pushed; on a mismatch, stop with "head moved on #<N>: re-run /finalize-stack".
+   - **State:** `gh pr view <N> --json isDraft,labels,baseRefName,headRefOid,mergeStateStatus`. `baseRefName` must equal `<default>` and `isDraft` must be false; otherwise stop with "#<N> base is <base>, not <default>" or "#<N> is a draft". A `no-automerge` label in `labels` stops with "#<N> is labelled no-automerge" (it was re-added after step 1). `headRefOid` must equal the SHA this run last pushed for that branch, or its `<pre-triage tip N>` if it was never pushed; on a mismatch, stop with "head moved on #<N>: re-run /finalize-stack".
    - **Checks:** `gh pr checks <N> --json bucket --jq '[.[] | select(.bucket != "pass" and .bucket != "skipping")] | length'` prints `0`. If it fails with `no checks reported on the '<branch>' branch`, the repo runs no CI on this PR: count it as `0`. Any other failure is a failed query: run it once more, and if it fails again, stop with "blocked: checks query failed". Drop `| length` to tell pending checks from failing ones: pending checks mean waiting for CI with `gh pr checks <N> --watch --interval 30` in the background (Bash, `run_in_background`), then re-check everything.
    - **Threads:** `bash "$HOME/.claude/skills/pr-review-loop/scripts/threads.sh" <N>` exits 0 and prints nothing. A non-zero exit is a failed query, not "no threads": run it once more, and if it fails again, stop with "blocked: review threads query failed".
    - **No feedback since triage:** check for feedback posted or edited after `<triage-time N>` by anyone but me (`<me>` is `gh api user --jq .login`). These are pr-review-loop Phase 4's three `events()` queries with `since=<triage-time N>`:
      ```bash
      since=<triage-time N>
      gh api --paginate "repos/{owner}/{repo}/pulls/<N>/reviews" --jq ".[] | select(.submitted_at > \"$since\" and .user.login != \"<me>\") | \"review \(.id) by \(.user.login)\"" || echo "feedback query failed"
-     gh api "repos/{owner}/{repo}/pulls/<N>/comments?since=$since" --jq ".[] | select(.user.login != \"<me>\") | \"inline \(.id) by \(.user.login) at \(.updated_at)\"" || echo "feedback query failed"
-     gh api "repos/{owner}/{repo}/issues/<N>/comments?since=$since" --jq ".[] | select(.user.login != \"<me>\") | \"comment \(.id) by \(.user.login) at \(.updated_at)\"" || echo "feedback query failed"
+     gh api --paginate "repos/{owner}/{repo}/pulls/<N>/comments?since=$since" --jq ".[] | select(.user.login != \"<me>\") | \"inline \(.id) by \(.user.login) at \(.updated_at)\"" || echo "feedback query failed"
+     gh api --paginate "repos/{owner}/{repo}/issues/<N>/comments?since=$since" --jq ".[] | select(.user.login != \"<me>\") | \"comment \(.id) by \(.user.login) at \(.updated_at)\"" || echo "feedback query failed"
      ```
      A `feedback query failed` line isn't clean: stop with "blocked: feedback query failed on #<N>". Any review, inline or comment line is new feedback that arrived after triage. The first time on #<N>, don't stop the run: take a fresh `<triage-time N>` (`date -u +%Y-%m-%dT%H:%M:%SZ`) before anything else, so feedback that lands while the fix is in flight still counts as new; then dispatch that PR's triage agent once more (the step 2.4 prompt, working only in that PR's checkout, told to handle the listed items), re-run step 4 for #<N> and the PRs above it, and re-check this list. A second batch of new feedback on the same PR stops with "new feedback on #<N> again after re-triage: re-run /finalize-stack".
    - **Merge state:** `mergeStateStatus` is `CLEAN`. On `UNKNOWN`, re-query with the **Monitor** tool, never a foreground wait (`timeout_ms: 180000`; it prints the state every 30 s, up to 3 times, and exits once it isn't `UNKNOWN`):

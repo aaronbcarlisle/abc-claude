@@ -739,10 +739,21 @@ class FinalizeStackTest(unittest.TestCase):
 
     def test_merge_checks_head_base_and_draft_and_retarget_fails_closed(self):
         step5 = section(body(skill("finalize-stack")), "## 5. Merge bottom-up")
-        for needle in ("--json isDraft,baseRefName,headRefOid,mergeStateStatus", "#<N> base is <base>, not <default>",
-                       "#<N> is a draft", "retarget of #<next> failed",
+        for needle in ("--json isDraft,labels,baseRefName,headRefOid,mergeStateStatus", "#<N> base is <base>, not <default>",
+                       "#<N> is a draft", "#<N> is labelled no-automerge", "retarget of #<next> failed",
                        "the SHA this run last pushed for that branch"):
             self.assertIn(needle, step5, needle)
+
+    def test_included_draft_or_opt_out_pr_is_opted_back_in(self):
+        step1 = section(body(skill("finalize-stack")), "## 1. Map the stack")
+        for needle in ("`no-automerge`", "`gh pr ready <N>`", "`gh pr edit <N> --remove-label no-automerge`",
+                       "could not include #<N>", "nothing to finalize: #<N> is left out"):
+            self.assertIn(needle, step1, needle)
+
+    def test_feedback_comment_queries_are_paginated(self):
+        step5 = section(body(skill("finalize-stack")), "## 5. Merge bottom-up")
+        for path in ("pulls/<N>/comments?since=$since", "issues/<N>/comments?since=$since"):
+            self.assertIn('gh api --paginate "repos/{owner}/{repo}/' + path, step5, path)
 
     def test_new_feedback_is_re_triaged_once_then_stops(self):
         step5 = section(body(skill("finalize-stack")), "## 5. Merge bottom-up")
