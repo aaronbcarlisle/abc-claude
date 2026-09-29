@@ -286,7 +286,8 @@ def cleanup(args, report):
                     keep("checked out in the main checkout, which has uncommitted changes")
                     continue
                 if not args.dry_run:
-                    switched = run(["git", "switch", "--quiet", default], repo, check=False)
+                    # git switch overwrites ignored files by default (a .env, a handoff): refuse instead.
+                    switched = run(["git", "switch", "--quiet", "--no-overwrite-ignore", default], repo, check=False)
                     if switched.returncode != 0:
                         keep("switch to %s failed: %s" % (default, switched.stderr.strip()))
                         continue
@@ -299,7 +300,8 @@ def cleanup(args, report):
                     keep("checked out in this session's worktree, which has uncommitted changes")
                     continue
                 if not args.dry_run:
-                    detached = run(["git", "switch", "--detach", "--quiet", target], path, check=False)
+                    detached = run(["git", "switch", "--detach", "--quiet", "--no-overwrite-ignore", target],
+                                   path, check=False)
                     if detached.returncode != 0:
                         keep("detach of this session's worktree failed: %s" % detached.stderr.strip())
                         continue

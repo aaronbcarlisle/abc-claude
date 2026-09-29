@@ -420,6 +420,23 @@ class WorktreeTest(CleanupCase):
         self.assertIsNone(self.detached_at(path))
         self.assertTrue(self.branch_exists("feat/a"))
 
+    def test_here_detach_never_overwrites_an_ignored_file(self):
+        # `git switch` overwrites ignored files by default; an ignored .env or handoff at a path
+        # origin/main tracks must make the detach fail instead.
+        path = self.here_worktree()
+        common = git(path, self.env, "rev-parse", "--path-format=absolute", "--git-common-dir").strip()
+        with open(os.path.join(common, "info", "exclude"), "a", encoding="utf-8") as f:
+            f.write("f2.txt\n")
+        self.write(path, "f2.txt", "ignored and precious\n")
+        self.live_session(path)
+        code, r = self.cleanup("--here", cwd=path)
+        self.assertEqual(code, 0, r)
+        self.assertTrue(self.kept(r)["feat/a"].startswith("detach of this session's worktree failed: "),
+                        self.kept(r))
+        with open(os.path.join(path, "f2.txt"), encoding="utf-8") as f:
+            self.assertEqual(f.read(), "ignored and precious\n")
+        self.assertTrue(self.branch_exists("feat/a"))
+
     def test_ignored_session_files_keep_the_worktree(self):
         # `git worktree remove` deletes ignored files, so an ignored handoff, SDD
         # ledger or .env would be lost with no copy anywhere.
