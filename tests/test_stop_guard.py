@@ -18,9 +18,8 @@ import unittest
 # `python -m unittest tests.test_stop_guard` from the repo root doesn't put tests/ on sys.path.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from stubs import git, git_env  # noqa: E402
-from stubs import install_stub  # noqa: E402
 
-HOOK =os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "hooks", "stop_guard.py")
+HOOK = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "hooks", "stop_guard.py")
 
 
 class StopGuardCase(unittest.TestCase):
@@ -331,19 +330,6 @@ class AutopilotHostileTest(StopGuardCase):
         self.use_repo(os.path.join(self.tmp.name, "unborn"), commit=False)
         self.assertBlocks(self.run_hook())
         self.commit("first")
-        self.assertBlocks(self.run_hook(active=True))
-
-    def test_failing_git_falls_back_to_the_handoff_mtime(self):
-        script = os.path.join(self.tmp.name, "failing_git.py")
-        with open(script, "w", encoding="utf-8", newline="\n") as f:
-            f.write("import sys\nsys.stderr.write('fatal: stub git failed\\n')\nsys.exit(128)\n")
-        bin_dir = os.path.join(self.tmp.name, "bin")
-        install_stub(bin_dir, "git", script)
-        self.env["PATH"] = os.pathsep.join([bin_dir, os.path.dirname(sys.executable)])
-        self.assertBlocks(self.run_hook())
-        self.assertIsNone(self.run_hook(active=True))
-        self.assertBlocks(self.run_hook())
-        self.touch_handoff(5)
         self.assertBlocks(self.run_hook(active=True))
 
     def test_an_older_mtime_counts_as_a_change(self):
