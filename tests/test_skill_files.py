@@ -588,5 +588,208 @@ class ShipLoopTest(unittest.TestCase):
         self.assertIn("Open PRs with `/ship`", body(os.path.join(REPO, "CLAUDE.md")))
 
 
+class FinalizeStackTest(unittest.TestCase):
+    def test_owner_invoked_only(self):
+        self.assertEqual(frontmatter(skill("finalize-stack")).get("disable-model-invocation"), "true")
+
+    def test_pre_approves_no_shell_or_interpreter(self):
+        allowed = frontmatter(skill("finalize-stack")).get("allowed-tools", [])
+        for rule in ("Bash(python:*)", "Bash(bash:*)"):
+            self.assertNotIn(rule, allowed, rule)
+        for rule in allowed:
+            if "post_merge_cleanup.py" in rule:
+                self.assertNotIn("*", rule, rule)
+        for rule in CLEANUP_RULES:
+            self.assertIn(rule, allowed, rule)
+        threads = 'Bash(bash "$HOME/.claude/skills/pr-review-loop/scripts/threads.sh" *)'
+        live = 'Bash(python "$HOME/.claude/scripts/live_sessions.py" *)'
+        self.assertIn(threads, allowed)
+        self.assertIn(live, allowed)
+        self.assertTrue(rule_matches(threads, 'bash "$HOME/.claude/skills/pr-review-loop/scripts/threads.sh" 12'))
+        self.assertTrue(rule_matches(live, 'python "$HOME/.claude/scripts/live_sessions.py" ../repo-s2'))
+        text = body(skill("finalize-stack"))
+        self.assertIn('bash "$HOME/.claude/skills/pr-review-loop/scripts/threads.sh" <N>', text)
+        self.assertNotIn("CLAUDE_SKILL_DIR", text)
+        self.assertIn("go through the normal permission check", text)
+
+    def test_force_pushes_only_with_lease_and_merges_bottom_up(self):
+        text = body(skill("finalize-stack"))
+        self.assertIn("--force-with-lease", text)
+        self.assertNotRegex(text, r"--force(?!-with-lease)")
+        self.assertIn("git rebase --update-refs", text)
+        self.assertIn("gh pr merge --squash --match-head-commit <head> <N>", text)
+        self.assertIn("post_merge_cleanup.py", text)
+
+    def test_reuses_a_checkout_that_already_holds_a_stack_branch(self):
+        # `git worktree add <path> <branch>` fails when <branch> is checked out anywhere, e.g. when
+        # the top branch is the current branch of the checkout /finalize-stack runs from.
+        text = body(skill("finalize-stack"))
+        self.assertIn("git worktree list --porcelain", text)
+        self.assertIn("the top branch is this checkout's current branch", text)
+        self.assertIn("git -C <path> status --porcelain --untracked-files=no", text)
+        self.assertIn("with uncommitted changes; commit or stash them there", text)
+        self.assertIn("In every PR's checkout except the top PR's, run `git switch --detach`", text)
+
+    def test_stops_on_unconfirmed_state_and_never_sleeps_in_the_foreground(self):
+        text = body(skill("finalize-stack"))
+        for needle in ("--match-head-commit", "feedback query failed", "reviews still pending",
+                       "<triage-time>", "timeout_ms: 180000", "blocked: review threads query failed",
+                       "blocked: checks query failed", "head moved on #<N>: re-run /finalize-stack",
+                       "new feedback on #<N> again after re-triage: re-run /finalize-stack",
+                       "--json mergeCommit --jq .mergeCommit.oid",
+                       "no checks reported on the '<branch>' branch"):
+            self.assertIn(needle, text, needle)
+        sleeping = [line for line in text.splitlines() if re.search(r"\bsleep\b", line)]
+        self.assertEqual(len(sleeping), 1, sleeping)
+        self.assertTrue(sleeping[0].strip().startswith("for i in 1 2 3; do sleep 30;"), sleeping)
+
+    def test_allowed_tools_are_exactly_the_reviewed_list(self):
+        cleanup = 'Bash(POST_MERGE_TEST_TIMEOUT=540 python "$HOME/.claude/scripts/post_merge_cleanup.py" --repo . --here'
+        expected = (["Bash(gh:*)", "Bash(git:*)", "Bash(npm:*)", "Bash(npx tsc *)", "Bash(pnpm:*)",
+                     "Bash(python -m unittest discover -s tests)",
+                     'Bash(bash "$HOME/.claude/skills/pr-review-loop/scripts/threads.sh" *)',
+                     'Bash(python "$HOME/.claude/scripts/live_sessions.py" *)', cleanup + ")"]
+                    + [cleanup + " --test '%s')" % t for t in ("python -m unittest discover -s tests",
+                                                              "npm test", "pnpm test")]
+                    + ["Monitor", "TaskStop", "Agent", "AskUserQuestion", "Skill", "Read", "Edit", "Write",
+                       "Grep", "Glob"])
+        self.assertEqual(frontmatter(skill("finalize-stack")).get("allowed-tools"), expected)
+
+    def test_force_pushes_carry_an_explicit_lease(self):
+        text = body(skill("finalize-stack"))
+        self.assertIn("--force-with-lease=<branch>:", text)
+        self.assertNotRegex(text, r"git push --force-with-lease origin")
+        self.assertNotRegex(text, r"--force-with-lease(?!=)[^\n]*origin|with `--force-with-lease`\.")
+
+    def test_checkouts_are_synced_with_the_pr_head_before_triage(self):
+        step2 = section(body(skill("finalize-stack")), "## 2. Triage in parallel")
+        self.assertIn("gh pr view <N> --json headRefOid --jq .headRefOid", step2)
+        self.assertIn("git -C <path> merge --ff-only <headRefOid>", step2)
+        self.assertIn("doesn't match PR #<N>'s head: sync it, then re-run /finalize-stack", step2)
+        self.assertIn("<pre-triage tip N>", step2)
+        self.assertIn("from that PR's checkout", step2)  # the Phase 4 wait reads `git rev-parse HEAD`
+
+    def test_restack_carries_lower_fixes_up_before_the_top_rebase(self):
+        step4 = section(body(skill("finalize-stack")), "## 4. Restack")
+        carry = step4.index("git rebase --onto <lower branch> <anchor> <this branch>")
+        top = step4.index("git rebase --update-refs origin/<default>")
+        self.assertLess(carry, top)
+        self.assertLess(step4.index("`<anchor>`"), carry)  # defined right before the command
+        self.assertNotIn("<pre-triage tip of the lower PR>", step4)
+        definition = re.search(r"^.*`<anchor>` is .*$", step4, re.M).group(0)
+        self.assertIn("`<anchor>` is the lower PR's `<base-of-above>`", definition)
+        self.assertNotIn("remote SHA", definition)  # the lease value must not decide the carry-up
+        self.assertNotIn("changed during triage", step4)
+        self.assertIn("differs from `<base-of-above>` of the lower PR", step4)
+        self.assertIn("(check this on every pass)", step4)
+        self.assertNotIn("holds on every pass", step4)
+        self.assertIn("<base-of-above N>", body(skill("finalize-stack")))
+        self.assertIn("moves only refs that point into the rebased range", step4)
+        self.assertIn("until step 2 below has carried them up", step4)
+
+    def test_the_remote_sha_is_only_what_this_run_pushed(self):
+        text = body(skill("finalize-stack"))
+        self.assertIn("a `git fetch` never updates it", text)
+        self.assertIn("rejected by its lease", text)
+        self.assertRegex(text, r"rejected by its lease[^\n]*head moved on #<N>: re-run /finalize-stack")
+
+    def test_a_ci_fix_is_pushed_with_the_lease_and_carried_up(self):
+        step4 = section(body(skill("finalize-stack")), "## 4. Restack")
+        red = step4[step4.index("Red CI on a PR"):]
+        for needle in ("explicit lease", "new remote SHA", "PRs above it", "`<anchor>`"):
+            self.assertIn(needle, red, needle)
+        step5 = section(body(skill("finalize-stack")), "## 5. Merge bottom-up")
+        self.assertIn("same push path as step 4 (lease, record, carry up)", step5)
+
+    def test_a_merged_bottom_is_found_by_branch_and_the_open_pr_is_retargeted(self):
+        text = body(skill("finalize-stack"))
+        self.assertIn("gh pr view <base branch> --json number,state,headRefOid", text)
+        self.assertIn("gh pr edit <N> --base <default>", text)
+        self.assertIn("retarget of #<N> failed", text)
+
+    def test_fix_commit_lookup_uses_fixed_strings(self):
+        # Single quotes: double quotes still expand backticks and `$(`, which fix subjects can contain.
+        text = body(skill("finalize-stack"))
+        self.assertIn("git log --format=%h -1 --fixed-strings --grep='<fix subject>' <branch>", text)
+        self.assertNotIn('--grep="<fix subject>"', text)
+        self.assertIn("any `'` in the subject as `'\\''`", text)
+
+    @staticmethod
+    def _step(text, n):
+        """The text of numbered step `n` (a `n. ` line at column 0) up to step `n + 1`."""
+        start = re.search(r"^%d\. " % n, text, re.M).start()
+        nxt = re.search(r"^%d\. " % (n + 1), text[start:], re.M)
+        return text[start:start + nxt.start()] if nxt else text[start:]
+
+    def test_both_restacks_refresh_base_of_above_after_their_rebase(self):
+        text = body(skill("finalize-stack"))
+        refresh = re.compile(r"set each (remaining )?lower PR's `<base-of-above>` to its branch's new tip")
+        top = self._step(section(text, "## 4. Restack"), 3)
+        rebase = top.index("git rebase --update-refs origin/<default>")
+        self.assertGreater(refresh.search(top).start(), rebase)
+        # The refresh is only right because the other checkouts were detached, so --update-refs moved them.
+        self.assertIn("assume `--update-refs` moved every lower ref", top)
+        self.assertIn("steps 4.1 and 5.3 detach every other checkout first", top)
+        merged = self._step(section(text, "## 5. Merge bottom-up"), 3)
+        rebase = merged.index("git rebase --update-refs --onto origin/<default> <merged head SHA> <top-branch>")
+        found = refresh.search(merged)
+        self.assertIsNotNone(found, merged)
+        self.assertGreater(found.start(), rebase)
+        self.assertLess(found.start(), merged.index("git push --force-with-lease="))  # before its pushes
+
+    def test_merge_checks_head_base_and_draft_and_retarget_fails_closed(self):
+        step5 = section(body(skill("finalize-stack")), "## 5. Merge bottom-up")
+        for needle in ("--json isDraft,labels,baseRefName,headRefOid,mergeStateStatus", "#<N> base is <base>, not <default>",
+                       "#<N> is a draft", "#<N> is labelled no-automerge", "retarget of #<next> failed",
+                       "the SHA this run last pushed for that branch"):
+            self.assertIn(needle, step5, needle)
+
+    def test_included_draft_or_opt_out_pr_is_opted_back_in(self):
+        step1 = section(body(skill("finalize-stack")), "## 1. Map the stack")
+        for needle in ("`no-automerge`", "`gh pr ready <N>`", "`gh pr edit <N> --remove-label no-automerge`",
+                       "could not include #<N>", "nothing to finalize: #<N> is left out"):
+            self.assertIn(needle, step1, needle)
+
+    def test_feedback_comment_queries_are_paginated(self):
+        step5 = section(body(skill("finalize-stack")), "## 5. Merge bottom-up")
+        for path in ("pulls/<N>/comments?since=$since", "issues/<N>/comments?since=$since"):
+            self.assertIn('gh api --paginate "repos/{owner}/{repo}/' + path, step5, path)
+
+    def test_new_feedback_is_re_triaged_once_then_stops(self):
+        step5 = section(body(skill("finalize-stack")), "## 5. Merge bottom-up")
+        self.assertIn("again after re-triage", step5)
+        # The fresh triage time comes before the re-triage, so feedback landing during the fix still counts.
+        fresh = step5.index("take a fresh `<triage-time N>`")
+        self.assertLess(fresh, step5.index("dispatch that PR's triage agent once more"))
+        # A PR with more than 30 reviews keeps the newest ones on later pages.
+        self.assertIn('gh api --paginate "repos/{owner}/{repo}/pulls/<N>/reviews"', step5)
+
+    def test_merges_the_checked_head_and_watches_the_next_pr(self):
+        step5 = section(body(skill("finalize-stack")), "## 5. Merge bottom-up")
+        merge = self._step(step5, 2)
+        self.assertIn("the `headRefOid` step 1 checked (don't re-query it", merge)
+        self.assertNotIn("gh pr view <N> --json headRefOid --jq .headRefOid`), then merge", merge)
+        self.assertIn("gh pr checks <next> --watch --interval 30", self._step(step5, 5))
+
+    def test_restack_gates_every_branch_it_pushes(self):
+        step4 = section(body(skill("finalize-stack")), "## 4. Restack")
+        self.assertIn("In each PR's checkout, the top PR's included", self._step(step4, 4))
+        self.assertIn("Phase 2 step 4 (how to find the gate commands", body(skill("finalize-stack")))
+
+    def test_cleanup_reports_timeouts_and_kept_branches(self):
+        cleanup = section(body(skill("finalize-stack")), "## 6. Cleanup")
+        self.assertIn("timed out after 540 s", cleanup)
+        self.assertIn("checked out in this session's worktree", cleanup)
+
+    def test_cleanup_runs_from_the_checkout_with_an_exact_command(self):
+        cleanup = section(body(skill("finalize-stack")), "## 6. Cleanup")
+        self.assertIn("timeout: 600000", cleanup)
+        self.assertIn("never start a second run", cleanup)
+        self.assertIn("--test '<gate test command>'", cleanup)
+        self.assertIn("no `$VAR`, `'…'`, `~` or `2>/dev/null`", cleanup)
+        for rule in CLEANUP_RULES:
+            self.assertIn(rule[len("Bash("):-1], cleanup, rule)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

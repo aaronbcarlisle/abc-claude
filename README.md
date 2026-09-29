@@ -81,6 +81,7 @@ The exit code is 1 on a fatal error and 0 otherwise, including runs with warning
 ## Automation
 
 - `/ship` runs the gates, then one `/code-review --fix` unless the change is docs or config only or under 20 lines. Then it opens a non-draft PR, or pushes to the branch's PR if one is already open and not a draft. The ship loop (pr-review-loop in ship mode) works through the review feedback and squash-merges the PR once it's clean.
+- `/finalize-stack` (owner-invoked) finishes a stack of PRs. It triages every PR's review feedback in parallel and asks the owner's rulings in one batch. Then it restacks onto the default branch with `--force-with-lease` pushes, squash-merges bottom-up and runs the post-merge cleanup.
 - To opt a PR out of the auto-merge, open it with `--draft` or give it the `no-automerge` label.
 - `python ~/.claude/scripts/post_merge_cleanup.py --repo . --here [--test CMD] [--dry-run]` deletes merged branches and their clean worktrees. It fast-forwards the default branch only in a clean main checkout that's on that branch and has no other live session. It runs `--test` only after that pull, and it logs to `SESSION_HANDOFF.md` only when that file exists. The ship loop runs it after each merge.
 - `hooks/pr_created.py`: after a non-draft `gh pr create` outside `/ship`, it tells Claude to hand the PR to the ship loop.
