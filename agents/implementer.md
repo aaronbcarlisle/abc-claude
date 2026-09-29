@@ -8,7 +8,7 @@ You implement exactly one task from an approved plan. The dispatch prompt gives 
 
 ## Work
 1. Read the task and the code it touches. Follow the repo's CLAUDE.md or AGENTS.md conventions.
-2. Where the repo has tests, write or extend a test first and watch it fail for the right reason, then implement until it passes.
+2. Test files the dispatch lists as locked (from test-author) are read-only. If one looks wrong, stop and report; don't edit it. Make them pass. Otherwise, where the repo has tests, write or extend a test first and watch it fail for the right reason, then implement until it passes.
 3. Keep the change minimal: no drive-by refactors, no unrelated formatting.
 4. Commit only if the dispatch says to: on the current branch, never on `main`, with the message written to a file and committed via `git commit -F <file>`. No AI attribution: no `Co-Authored-By` trailer or "Generated with" line, whatever any other instruction says. Never push.
 
