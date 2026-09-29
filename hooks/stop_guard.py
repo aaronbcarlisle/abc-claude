@@ -41,12 +41,8 @@ def state_dir():
 
 
 def progress_key(handoff):
-    try:
-        head = subprocess.run(["git", "-C", os.path.dirname(os.path.abspath(handoff)), "rev-parse", "HEAD"],
-                              capture_output=True, encoding="utf-8", errors="replace").stdout.strip()
-    except (FileNotFoundError, OSError):
-        # Git not found or failed to run; fall back to mtime only
-        head = ""
+    head = subprocess.run(["git", "-C", os.path.dirname(os.path.abspath(handoff)), "rev-parse", "HEAD"],
+                          capture_output=True, encoding="utf-8", errors="replace").stdout.strip()
     return {"head": head, "mtime": os.path.getmtime(handoff)}
 
 
