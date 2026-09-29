@@ -677,10 +677,37 @@ class FinalizeStackTest(unittest.TestCase):
 
     def test_restack_carries_lower_fixes_up_before_the_top_rebase(self):
         step4 = section(body(skill("finalize-stack")), "## 4. Restack")
-        carry = step4.index("git rebase --onto <lower branch> <pre-triage tip of the lower PR> <this branch>")
+        carry = step4.index("git rebase --onto <lower branch> <anchor> <this branch>")
         top = step4.index("git rebase --update-refs origin/<default>")
         self.assertLess(carry, top)
+        self.assertLess(step4.index("`<anchor>`"), carry)  # defined right before the command
+        self.assertNotIn("<pre-triage tip of the lower PR>", step4)
         self.assertIn("moves only refs that point into the rebased range", step4)
+        self.assertIn("until step 2 below has carried them up", step4)
+
+    def test_the_remote_sha_is_only_what_this_run_pushed(self):
+        text = body(skill("finalize-stack"))
+        self.assertIn("a `git fetch` never updates it", text)
+        self.assertIn("rejected by its lease", text)
+        self.assertRegex(text, r"rejected by its lease[^\n]*head moved on #<N>: re-run /finalize-stack")
+
+    def test_a_ci_fix_is_pushed_with_the_lease_and_carried_up(self):
+        step4 = section(body(skill("finalize-stack")), "## 4. Restack")
+        red = step4[step4.index("Red CI on a PR"):]
+        for needle in ("explicit lease", "new remote SHA", "PRs above it", "`<anchor>`"):
+            self.assertIn(needle, red, needle)
+        step5 = section(body(skill("finalize-stack")), "## 5. Merge bottom-up")
+        self.assertIn("same push path as step 4 (lease, record, carry up)", step5)
+
+    def test_a_merged_bottom_is_found_by_branch_and_the_open_pr_is_retargeted(self):
+        text = body(skill("finalize-stack"))
+        self.assertIn("gh pr view <base branch> --json number,state,headRefOid", text)
+        self.assertIn("gh pr edit <N> --base <default>", text)
+        self.assertIn("retarget of #<N> failed", text)
+
+    def test_fix_commit_lookup_uses_fixed_strings(self):
+        self.assertIn("git log --format=%h -1 --fixed-strings --grep=<fix subject> <branch>",
+                      body(skill("finalize-stack")))
 
     def test_merge_checks_head_base_and_draft_and_retarget_fails_closed(self):
         step5 = section(body(skill("finalize-stack")), "## 5. Merge bottom-up")
