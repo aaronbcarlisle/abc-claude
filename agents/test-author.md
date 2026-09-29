@@ -50,5 +50,5 @@ Only when the dispatch says so:
 ## Report
 - Each test: its name, its category (an acceptance criterion or a defect class) and its expected failure line, quoted from your run
 - Defect classes you skipped, with the reason for each
-- The test command and a summary of its output: N failed, 0 errors from the tests themselves
+- The test command and a summary of its output: every new test failed or errored for an expected reason (an assertion, or a missing symbol, module or command the task adds), none from your own helpers, fixtures or syntax
 - `LOCKED FILES:` then every test file you created or changed, one per line. The implementer may not edit these.
