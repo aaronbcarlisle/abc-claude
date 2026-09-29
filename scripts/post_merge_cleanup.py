@@ -131,7 +131,7 @@ def worktrees(repo):
 
 
 def dirty(path):
-    """True when the main checkout at `path` has tracked changes; untracked files don't count."""
+    """True when the checkout at `path` has tracked changes; untracked files don't count."""
     return bool(git(path, "status", "--porcelain", "--untracked-files=no"))
 
 
