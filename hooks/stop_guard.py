@@ -27,7 +27,8 @@ NO_RESPONSE = re.compile(r"^no response requested\.?$", re.I)
 REASON = ("Don't stop on 'No response requested': continue the skill or task you were "
           "running, or say what you're waiting for.")
 AUTOPILOT_REASON = ("Autopilot: the handoff says continue. Dispatch the next task. If it needs the owner, "
-                    "set `Autopilot: owner`, write the owner checklist, run /handoff, then stop.")
+                    "run /handoff with the focus note `owner gate: <what>` (it sets `Autopilot: owner` "
+                    "and writes the owner checklist), then stop.")
 
 
 def block(reason):
@@ -57,11 +58,13 @@ def autopilot_block(session):
     # Lazy import: only load handoff_state when autopilot is active
     sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts"))
     import handoff_state  # noqa: E402
+    path = os.path.join(state_dir(), re.sub(r"[^\w-]", "_", session or "none") + ".json")
     if handoff_state.autopilot_state(handoff) != "continue":
+        if os.path.isfile(path):
+            os.remove(path)  # the run is ending on owner or done: drop this session's state
         return False
     key = progress_key(handoff)
     os.makedirs(state_dir(), exist_ok=True)
-    path = os.path.join(state_dir(), re.sub(r"[^\w-]", "_", session or "none") + ".json")
     try:
         with open(path, encoding="utf-8") as f:
             previous = json.load(f)

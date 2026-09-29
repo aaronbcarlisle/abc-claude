@@ -20,7 +20,8 @@ It stops when:
   first read and at the top of every loop pass; the handoff is then left
   untouched);
 - the checkout has a modified or staged tracked file at start ("dirty-tree",
-  refused before the first run; untracked files don't count; not re-checked
+  refused before the first run; untracked files and SESSION_HANDOFF.md itself
+  don't count; not re-checked
   between runs, so a tree an earlier run left dirty is continued);
 - the handoff can't be read (`error: handoff status failed`) or anything throws
   (`error: <first line of the message>`).
@@ -147,6 +148,10 @@ function Get-LimitWait($Run) {
     if ($byEvent -and $Run.Limit.resetsAt) {
         return [Math]::Max([long]60, [long]$Run.Limit.resetsAt - [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() + 60)
     }
+    # The text form can carry the reset as a Unix time: "Claude AI usage limit reached|1759300000".
+    if ($byText -and "$($result.result)" -match '\|(\d{10})\b') {
+        return [Math]::Max([long]60, [long]$Matches[1] - [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() + 60)
+    }
     return [long]$DefaultWait
 }
 
@@ -160,7 +165,10 @@ Write-Log ('autopilot start {0} repo={1} max-runs={2} max-turns={3} budget={4} m
 try {
     if (Test-LiveSession) { $status = 'live-session' }
     # Once, at start: a tree left dirty by an autopilot run is checked only at the next start.
-    if ($null -eq $status -and (& git -C $Repo status --porcelain --untracked-files=no)) { $status = 'dirty-tree' }
+    # The handoff itself doesn't count: a tracked one carries the last summary line or the owner's edit.
+    if ($null -eq $status -and (& git -C $Repo status --porcelain --untracked-files=no -- ':/' ':(exclude)SESSION_HANDOFF.md')) {
+        $status = 'dirty-tree'
+    }
     $first = $true
     while ($null -eq $status) {
         # The owner may have opened a session during a sleep; the first pass was checked above.
@@ -170,8 +178,8 @@ try {
         if ($state.autopilot -ne 'continue') { $status = Get-StateName $state; break }
         if ($runs -ge $MaxRuns) { $status = 'max-runs'; break }
         $remaining = $BudgetUsd - $spent
-        if ($remaining -le 0) { $status = 'budget'; break }
-        if (Test-LiveSession) { $status = 'live-session'; break }
+        # Under a cent is spent: it would reach claude as --max-budget-usd 0.00.
+        if ([Math]::Round($remaining, 2) -le 0) { $status = 'budget'; break }
 
         $headBefore = Get-Head
         $progressBefore = "$($state.progress)"   # Progress Log content signature, not an entry count

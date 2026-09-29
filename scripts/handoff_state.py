@@ -15,6 +15,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import sys
 import tempfile
 import time
@@ -76,6 +77,10 @@ def _write_atomic(path, data):
     try:
         with os.fdopen(fd, "wb") as f:
             f.write(data)
+        try:
+            shutil.copymode(path, tmp)  # mkstemp makes it 0600; keep the handoff's own mode
+        except OSError:
+            pass
         for attempt in range(5):
             try:
                 os.replace(tmp, path)
