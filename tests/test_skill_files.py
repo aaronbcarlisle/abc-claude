@@ -791,5 +791,32 @@ class FinalizeStackTest(unittest.TestCase):
             self.assertIn(rule[len("Bash("):-1], cleanup, rule)
 
 
+class AgentFilesTest(unittest.TestCase):
+    def agent(self, name):
+        return os.path.join(REPO, "agents", name + ".md")
+
+    def test_every_agent_has_a_matching_name_and_a_description(self):
+        for rel in tracked("agents/*.md"):
+            data = frontmatter(os.path.join(REPO, rel))
+            self.assertEqual(data.get("name"), os.path.basename(rel)[:-3], rel)
+            self.assertTrue(data.get("description"), rel)
+
+    def test_test_author_runs_on_opus_with_file_tools(self):
+        data = frontmatter(self.agent("test-author"))
+        self.assertEqual(data.get("model"), "opus")
+        self.assertEqual([t.strip() for t in data.get("tools", "").split(",")],
+                         ["Read", "Grep", "Glob", "Write", "Edit", "Bash"])
+        text = body(self.agent("test-author"))
+        self.assertIn("LOCKED FILES", text)
+        self.assertIn("fail for the right reason", text)
+        self.assertNotIn("keep it and say why", text)
+
+    def test_implementer_treats_locked_tests_as_read_only(self):
+        self.assertIn("locked (from test-author) are read-only", body(self.agent("implementer")))
+
+    def test_claude_md_dispatches_test_author_first(self):
+        self.assertIn("dispatch `test-author` before the implementer", body(os.path.join(REPO, "CLAUDE.md")))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
