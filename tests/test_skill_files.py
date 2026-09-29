@@ -687,6 +687,8 @@ class FinalizeStackTest(unittest.TestCase):
         self.assertNotIn("remote SHA", definition)  # the lease value must not decide the carry-up
         self.assertNotIn("changed during triage", step4)
         self.assertIn("differs from `<base-of-above>` of the lower PR", step4)
+        self.assertIn("(check this on every pass)", step4)
+        self.assertNotIn("holds on every pass", step4)
         self.assertIn("<base-of-above N>", body(skill("finalize-stack")))
         self.assertIn("moves only refs that point into the rebased range", step4)
         self.assertIn("until step 2 below has carried them up", step4)
@@ -712,8 +714,34 @@ class FinalizeStackTest(unittest.TestCase):
         self.assertIn("retarget of #<N> failed", text)
 
     def test_fix_commit_lookup_uses_fixed_strings(self):
-        self.assertIn('git log --format=%h -1 --fixed-strings --grep="<fix subject>" <branch>',
-                      body(skill("finalize-stack")))
+        # Single quotes: double quotes still expand backticks and `$(`, which fix subjects can contain.
+        text = body(skill("finalize-stack"))
+        self.assertIn("git log --format=%h -1 --fixed-strings --grep='<fix subject>' <branch>", text)
+        self.assertNotIn('--grep="<fix subject>"', text)
+        self.assertIn("any `'` in the subject as `'\\''`", text)
+
+    @staticmethod
+    def _step(text, n):
+        """The text of numbered step `n` (a `n. ` line at column 0) up to step `n + 1`."""
+        start = re.search(r"^%d\. " % n, text, re.M).start()
+        nxt = re.search(r"^%d\. " % (n + 1), text[start:], re.M)
+        return text[start:start + nxt.start()] if nxt else text[start:]
+
+    def test_both_restacks_refresh_base_of_above_after_their_rebase(self):
+        text = body(skill("finalize-stack"))
+        refresh = re.compile(r"set each (remaining )?lower PR's `<base-of-above>` to its branch's new tip")
+        top = self._step(section(text, "## 4. Restack"), 3)
+        rebase = top.index("git rebase --update-refs origin/<default>")
+        self.assertGreater(refresh.search(top).start(), rebase)
+        # The refresh is only right because the other checkouts were detached, so --update-refs moved them.
+        self.assertIn("assume `--update-refs` moved every lower ref", top)
+        self.assertIn("steps 4.1 and 5.3 detach every other checkout first", top)
+        merged = self._step(section(text, "## 5. Merge bottom-up"), 3)
+        rebase = merged.index("git rebase --update-refs --onto origin/<default> <merged head SHA> <top-branch>")
+        found = refresh.search(merged)
+        self.assertIsNotNone(found, merged)
+        self.assertGreater(found.start(), rebase)
+        self.assertLess(found.start(), merged.index("git push --force-with-lease="))  # before its pushes
 
     def test_merge_checks_head_base_and_draft_and_retarget_fails_closed(self):
         step5 = section(body(skill("finalize-stack")), "## 5. Merge bottom-up")
