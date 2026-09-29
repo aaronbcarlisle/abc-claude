@@ -15,17 +15,24 @@ It stops when:
   ("stalled"; compared by `handoff_state.py status`'s content signature, so a
   rewritten entry counts as a change);
 - the budget is spent;
+- a usage-limit reset is more than 28800 s (8 hours) away ("usage-limit");
 - a live Claude Code session is in the checkout (checked before the handoff is
-  first read and before every run; the handoff is then left untouched);
+  first read and at the top of every loop pass; the handoff is then left
+  untouched);
+- the checkout has a modified or staged tracked file at start ("dirty-tree",
+  refused before the first run; untracked files don't count; not re-checked
+  between runs, so a tree an earlier run left dirty is continued);
 - the handoff can't be read (`error: handoff status failed`) or anything throws
   (`error: <first line of the message>`).
 
 A usage-limit stop sleeps until the reset time (30 minutes when none is given)
-and continues. The stream-json goes to ~/.claude/state/autopilot/, and a
+and continues, unless no run can follow (max runs or budget reached: sleeps 0 s)
+or the wait is over the cap. The stream-json goes to ~/.claude/state/autopilot/, and a
 summary line is appended to the handoff's Progress Log.
 
 Exit: 0 ended normally (done, owner, no Autopilot line, max runs); 1 stalled,
-budget or error; 2 refused (no such repo, not a git repo, live session).
+budget, usage-limit or error; 2 refused (no such repo, not a git repo, live
+session, dirty tree).
 
 Test overrides: AUTOPILOT_STATE_DIR (log directory), AUTOPILOT_MAX_SLEEP_SECONDS
 (caps each usage-limit sleep), CLAUDE_SESSIONS_DIR (read by live_sessions.py).
@@ -46,6 +53,7 @@ $Utf8 = [Text.UTF8Encoding]::new($false)
 $OutputEncoding = $Utf8
 $Invariant = [Globalization.CultureInfo]::InvariantCulture
 $DefaultWait = 1800
+$MaxWait = 28800
 
 if (-not (Test-Path -LiteralPath $Repo -PathType Container)) {
     [Console]::Error.WriteLine("autopilot: no such directory: $Repo")
@@ -151,7 +159,13 @@ Write-Log ('autopilot start {0} repo={1} max-runs={2} max-turns={3} budget={4} m
 
 try {
     if (Test-LiveSession) { $status = 'live-session' }
+    # Once, at start: a tree left dirty by an autopilot run is checked only at the next start.
+    if ($null -eq $status -and (& git -C $Repo status --porcelain --untracked-files=no)) { $status = 'dirty-tree' }
+    $first = $true
     while ($null -eq $status) {
+        # The owner may have opened a session during a sleep; the first pass was checked above.
+        if (-not $first -and (Test-LiveSession)) { $status = 'live-session'; break }
+        $first = $false
         $state = Get-HandoffState
         if ($state.autopilot -ne 'continue') { $status = Get-StateName $state; break }
         if ($runs -ge $MaxRuns) { $status = 'max-runs'; break }
@@ -168,7 +182,13 @@ try {
 
         $wait = Get-LimitWait $run
         if ($null -ne $wait) {
-            $sleep = [Math]::Min([long]$wait, $MaxSleep)
+            # The cap and the no-follow rule judge the computed wait, before the test cap.
+            if ($wait -gt $MaxWait) {
+                Write-Log ('usage limit: reset in {0} s, over the {1} s cap' -f $wait, $MaxWait)
+                $status = 'usage-limit'
+                break
+            }
+            $sleep = if ($runs -ge $MaxRuns -or ($BudgetUsd - $spent) -le 0) { 0 } else { [Math]::Min([long]$wait, $MaxSleep) }
             Write-Log ('usage limit: reset in {0} s, sleeping {1} s' -f $wait, $sleep)
             if ($sleep -gt 0) { Start-Sleep -Seconds $sleep }
             continue
@@ -195,11 +215,12 @@ if ($sha.Length -gt 7) { $sha = $sha.Substring(0, 7) }
 $summary = '- {0} | autopilot | {1} | runs {2} | ${3} | {4}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm'), $status, $runs,
     $spent.ToString('0.00', $Invariant), $sha
 Write-Log "autopilot end: $summary"
-# Another session owns the handoff on a live-session refusal: never touch it.
-if ($status -ne 'live-session' -and (Test-Path -LiteralPath $Handoff)) {
+# Another session owns the handoff on a live-session refusal, and a dirty-tree
+# refusal never writes it: never touch it.
+if ($status -notin 'live-session', 'dirty-tree' -and (Test-Path -LiteralPath $Handoff)) {
     & python (Join-Path $Scripts 'handoff_state.py') append $Handoff $summary *> $null
 }
 Write-Output $summary
 if ($status -in 'done', 'owner', 'no-autopilot-line', 'max-runs') { exit 0 }
-if ($status -eq 'live-session') { exit 2 }
+if ($status -in 'live-session', 'dirty-tree') { exit 2 }
 exit 1
