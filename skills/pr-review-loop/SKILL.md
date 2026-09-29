@@ -319,7 +319,7 @@ Reading the cleanup's exit code and output:
 - Exit 1: `tests: fail` on the default branch after the merge. Report it first, in bold, with the output tail. If the tail ends `timed out after 540 s`, say the tests timed out instead.
 - Exit 2: either `post-merge cleanup refused: <reason>` (nothing changed) or `post-merge cleanup failed: <error>` followed by what was already deleted or kept. Report the line as printed.
 - Exit 0 with `tests: skipped` isn't a failure. Report the `note:` that says why: a live session or uncommitted changes in the main checkout, main not on the default branch, or pull failed. Without `--test` there is no note: the tests are always skipped.
-- A kept branch `checked out in this session's worktree` is expected; tell the owner to remove that worktree after the session ends.
+- A branch checked out in this session's worktree is deleted once the worktree is detached at origin/<default>. Report the `note:` that says so; it tells the owner to start the next branch with `git switch -c`. The branch is kept only when the worktree has uncommitted changes, another live session is in it, or the detach failed: report the kept reason as printed (`checked out in this session's worktree, which has uncommitted changes`, `worktree <path> has a live session`, or `detach of this session's worktree failed: <error>`).
 
 ---
 
