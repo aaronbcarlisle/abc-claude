@@ -61,11 +61,13 @@ if (-not (Test-Path -LiteralPath $Repo -PathType Container)) {
     exit 2
 }
 $Repo = (Resolve-Path -LiteralPath $Repo).Path
-& git -C $Repo rev-parse --show-toplevel *> $null
-if ($LASTEXITCODE -ne 0) {
+$top = & git -C $Repo rev-parse --show-toplevel 2>$null
+if ($LASTEXITCODE -ne 0 -or -not "$top".Trim()) {
     [Console]::Error.WriteLine("autopilot: not a git repository: $Repo")
     exit 2
 }
+# A subdirectory means its checkout: the handoff and the live-session check belong to the top level.
+$Repo = (Resolve-Path -LiteralPath "$top".Trim()).Path
 
 $Scripts = $PSScriptRoot
 $Handoff = Join-Path $Repo 'SESSION_HANDOFF.md'
@@ -196,7 +198,7 @@ try {
                 $status = 'usage-limit'
                 break
             }
-            $sleep = if ($runs -ge $MaxRuns -or ($BudgetUsd - $spent) -le 0) { 0 } else { [Math]::Min([long]$wait, $MaxSleep) }
+            $sleep = if ($runs -ge $MaxRuns -or [Math]::Round($BudgetUsd - $spent, 2) -le 0) { 0 } else { [Math]::Min([long]$wait, $MaxSleep) }
             Write-Log ('usage limit: reset in {0} s, sleeping {1} s' -f $wait, $sleep)
             if ($sleep -gt 0) { Start-Sleep -Seconds $sleep }
             continue
