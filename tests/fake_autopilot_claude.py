@@ -18,6 +18,8 @@ Optional extra run keys (additive; absent means no effect):
 - "stderr": ["line", ...] lines written to stderr, before anything on stdout.
 - "raw": ["line", ...] lines printed to stdout as-is, after the stderr lines
   and before the events (e.g. non-JSON noise in the stream).
+- "dirty": true appends a line to the tracked README.md without staging or
+  committing it, so the run leaves the work tree dirty (after any "commit").
 """
 
 import json
@@ -66,6 +68,9 @@ def main(argv):
             f.write("run %d\n" % n)
         subprocess.run(["git", "add", "work.txt"], check=True, capture_output=True)
         subprocess.run(["git", "commit", "-q", "-m", "run %d" % n], check=True, capture_output=True)
+    if run.get("dirty"):
+        with open("README.md", "a", encoding="utf-8") as f:
+            f.write("uncommitted edit %d\n" % n)
     if run.get("progress"):
         handoff_state.append_progress(HANDOFF, run["progress"])
     if run.get("rewrite"):

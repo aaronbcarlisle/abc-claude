@@ -567,6 +567,219 @@ class AutopilotTest(unittest.TestCase):
         self.assertTrue(text.startswith("autopilot start"), text[:200])
         self.assertIn("autopilot end: " + summary, text)
 
+    # == Final-review fixes: H1 (bounded sleeps, live re-check), H2 (dirty tree) ======
+
+    # -- helpers ---------------------------------------------------------------
+
+    def limited_run(self, reset_in=None, cost=0):
+        resets_at = None if reset_in is None else int(time.time()) + reset_in
+        return run(events=[self.limit_event(resets_at=resets_at),
+                           result(cost=cost, error=True, subtype="error_during_execution",
+                                  text="usage limit reached")], commit=False)
+
+    def timed_autopilot(self, *args):
+        start = time.monotonic()
+        proc = self.autopilot(*args)
+        return proc, time.monotonic() - start
+
+    def modify_readme(self):
+        with open(os.path.join(self.repo, "README.md"), "a", encoding="utf-8") as f:
+            f.write("owner's uncommitted edit\n")
+
+    def wait_for_log(self, proc, text, timeout=120):
+        # Polls the log for `text` while the autopilot runs; None if it exits or times out first.
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline and proc.poll() is None:
+            for path in glob.glob(os.path.join(self.state, "*.log")):
+                try:
+                    with open(path, encoding="utf-8", errors="replace") as f:
+                        if text in f.read():
+                            return path
+                except OSError:
+                    pass
+            time.sleep(0.05)
+        return None
+
+    # -- H1: no sleep when no run can follow ----------------------------------------
+
+    def test_limit_on_the_last_allowed_run_does_not_sleep(self):
+        self.env["AUTOPILOT_MAX_SLEEP_SECONDS"] = "120"
+        self.script(self.limited_run(3600), run(autopilot="done"))
+        proc, elapsed = self.timed_autopilot("-MaxRuns", "1")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(len(self.calls()), 1)
+        self.assertRegex(self.log_text(), r"usage limit: reset in 36\d\d s, sleeping 0 s")
+        self.assertLess(elapsed, 60)
+        self.assertRegex(self.last_line(), SUMMARY % ("max-runs", 1, r"0\.00"))
+
+    def test_limit_that_spends_the_budget_does_not_sleep(self):
+        self.env["AUTOPILOT_MAX_SLEEP_SECONDS"] = "120"
+        self.script(self.limited_run(3600, cost=1), run(autopilot="done"))
+        proc, elapsed = self.timed_autopilot("-BudgetUsd", "1")
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertEqual(len(self.calls()), 1)
+        self.assertRegex(self.log_text(), r"usage limit: reset in 36\d\d s, sleeping 0 s")
+        self.assertLess(elapsed, 60)
+        self.assertRegex(self.last_line(), SUMMARY % ("budget", 1, r"1\.00"))
+
+    # -- H1: the 8-hour cap ------------------------------------------------------------
+
+    def test_reset_over_the_cap_ends_as_usage_limit(self):
+        self.env["AUTOPILOT_MAX_SLEEP_SECONDS"] = "120"
+        self.script(self.limited_run(40000), run(autopilot="done"))
+        proc, elapsed = self.timed_autopilot()
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertEqual(len(self.calls()), 1)
+        text = self.log_text()
+        match = re.search(r"usage limit: reset in (\d+) s, over the 28800 s cap", text)
+        self.assertIsNotNone(match, text[-2000:])
+        self.assertTrue(39900 <= int(match.group(1)) <= 40060, match.group(0))
+        self.assertNotRegex(text, r"usage limit: reset in \d+ s, sleeping")
+        self.assertLess(elapsed, 60)
+        summary = self.stdout_summary(proc, "usage-limit", 1, r"0\.00")
+        self.assertEqual(self.last_line(), summary)
+        self.assertIn("autopilot end: " + summary, text)
+
+    def test_reset_under_the_cap_continues_and_a_later_one_over_it_stops(self):
+        self.script(self.limited_run(28000), self.limited_run(40000), run(autopilot="done"))
+        proc = self.autopilot()
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertEqual(len(self.calls()), 2)
+        text = self.log_text()
+        slept = re.findall(r"usage limit: reset in (\d+) s, sleeping 0 s", text)
+        self.assertEqual(len(slept), 1, text[-2000:])
+        self.assertTrue(27900 <= int(slept[0]) <= 28060, slept)
+        self.assertRegex(text, r"usage limit: reset in \d+ s, over the 28800 s cap")
+        self.assertRegex(self.last_line(), SUMMARY % ("usage-limit", 2, r"0\.00"))
+
+    # -- H1: the live session is re-checked before the handoff is read ---------------
+
+    def test_session_opened_during_the_sleep_refuses_before_the_handoff_is_read(self):
+        # The owner opens a session and sets `Autopilot: owner` while the autopilot sleeps
+        # off a limit: it must refuse as live-session without reading or touching the handoff.
+        self.env["AUTOPILOT_MAX_SLEEP_SECONDS"] = "15"
+        self.script(self.limited_run(3600), run(autopilot="done"))
+        proc = subprocess.Popen([PWSH, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", SCRIPT,
+                                 "-Repo", self.repo], cwd=self.tmp.name, env=self.env,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                encoding="utf-8", errors="replace")
+        try:
+            seen = self.wait_for_log(proc, "usage limit: reset in")
+            if seen:
+                self.live_session(self.repo)
+                self.write_handoff("owner")
+            before = self.handoff_bytes()
+            stdout, stderr = proc.communicate(timeout=300)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.communicate()
+        self.assertIsNotNone(seen, "no usage-limit line in the log while it ran:\n%s\n%s" % (stdout, stderr))
+        self.assertEqual(proc.returncode, 2, stdout + stderr)
+        self.assertEqual(len(self.calls()), 1)
+        self.assertEqual(self.handoff_bytes(), before)
+        self.assertRegex(stdout, re.compile(SUMMARY % ("live-session", 1, r"0\.00"), re.M))
+
+    # -- H2: refuse a dirty tree at start ---------------------------------------------
+
+    def test_modified_tracked_file_refuses(self):
+        self.modify_readme()
+        before = self.handoff_bytes()
+        self.script(run(autopilot="done"))
+        proc = self.autopilot()
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        self.assertEqual(self.calls(), [])
+        summary = self.stdout_summary(proc, "dirty-tree", 0, r"0\.00")
+        self.assertEqual(self.handoff_bytes(), before)
+        self.assertIn("autopilot end: " + summary, self.log_text())
+
+    def test_dirty_tree_beats_a_done_handoff(self):
+        # Checked before the first handoff read, so `done` can't end it first.
+        self.write_handoff("done")
+        self.modify_readme()
+        before = self.handoff_bytes()
+        self.script(run())
+        proc = self.autopilot()
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        self.assertEqual(self.calls(), [])
+        self.stdout_summary(proc, "dirty-tree", 0, r"0\.00")
+        self.assertEqual(self.handoff_bytes(), before)
+
+    def test_dirty_tree_with_no_handoff_does_not_create_one(self):
+        os.remove(self.handoff)
+        self.modify_readme()
+        self.script(run())
+        proc = self.autopilot()
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        self.assertEqual(self.calls(), [])
+        self.stdout_summary(proc, "dirty-tree", 0, r"0\.00")
+        self.assertFalse(os.path.exists(self.handoff))
+
+    def test_staged_changes_refuse(self):
+        def modify_and_stage():
+            self.modify_readme()
+            git(self.repo, self.env, "add", "README.md")
+
+        def add_new_file():
+            # A staged new file with a unicode, spaced name shows even with --untracked-files=no.
+            name = "névé … file.txt"
+            with open(os.path.join(self.repo, name), "w", encoding="utf-8") as f:
+                f.write("new\n")
+            git(self.repo, self.env, "add", "--", name)
+
+        for name, stage in (("staged modification", modify_and_stage), ("staged new file", add_new_file)):
+            with self.subTest(name):
+                # Each case starts from a clean tree, a `continue` handoff and no calls.
+                git(self.repo, self.env, "reset", "-q", "--hard")
+                for path in (self.calls_file, self.env["FAKE_AUTOPILOT_COUNT"]):
+                    if os.path.exists(path):
+                        os.remove(path)
+                self.write_handoff("continue")
+                before = self.handoff_bytes()
+                stage()
+                self.script(run(autopilot="done"))
+                proc = self.autopilot()
+                self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+                self.assertEqual(self.calls(), [])
+                self.stdout_summary(proc, "dirty-tree", 0, r"0\.00")
+                self.assertEqual(self.handoff_bytes(), before)
+
+    def test_untracked_files_do_not_count_but_a_tracked_change_does(self):
+        os.makedirs(os.path.join(self.repo, ".superpowers", "sdd"))
+        for rel in ("notes.txt", os.path.join(".superpowers", "sdd", "ledger.md"), "ünïcode $HOME %PATH%.txt"):
+            with open(os.path.join(self.repo, rel), "w", encoding="utf-8") as f:
+                f.write("untracked\n")
+        self.modify_readme()
+        self.script(run(autopilot="done"))
+        proc = self.autopilot()
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        self.assertEqual(self.calls(), [])
+        self.stdout_summary(proc, "dirty-tree", 0, r"0\.00")
+        # Only the untracked files (and the untracked handoff) left: it runs.
+        git(self.repo, self.env, "checkout", "-q", "--", "README.md")
+        proc = self.autopilot()
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(len(self.calls()), 1)
+        self.stdout_summary(proc, "done", 1, r"0\.50")
+
+    def test_a_tree_left_dirty_by_a_run_is_checked_only_at_the_next_start(self):
+        dirty = run()
+        dirty["dirty"] = True
+        self.script(dirty, run(commit=False, autopilot="done"), run(autopilot="done"))
+        proc = self.autopilot()
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(len(self.calls()), 2)
+        self.stdout_summary(proc, "done", 2, r"1\.00")
+        self.assertNotEqual(git(self.repo, self.env, "status", "--porcelain", "--untracked-files=no"), "")
+        # The next night starts on the tree the last run left dirty: refused.
+        self.write_handoff("continue")
+        before = self.handoff_bytes()
+        proc = self.autopilot()
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        self.assertEqual(len(self.calls()), 2)
+        self.stdout_summary(proc, "dirty-tree", 0, r"0\.00")
+        self.assertEqual(self.handoff_bytes(), before)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
