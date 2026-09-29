@@ -2,8 +2,9 @@
 
 Each call takes the next run from the JSON list in FAKE_AUTOPILOT_RUNS (the call
 count lives in FAKE_AUTOPILOT_COUNT). It then:
-1. logs its argv, cwd and CLAUDE_AUTOPILOT* environment to FAKE_AUTOPILOT_LOG,
-   one JSON line per call;
+1. logs its argv, cwd and CLAUDE_AUTOPILOT* environment (CLAUDE_AUTOPILOT as
+   "autopilot", CLAUDE_AUTOPILOT_HANDOFF as "handoff", CLAUDE_AUTOPILOT_SESSION
+   as "session"; null when unset) to FAKE_AUTOPILOT_LOG, one JSON line per call;
 2. applies the run's effects to the repo in the current directory;
 3. prints the run's events as stream-json;
 4. exits with the run's code.
@@ -59,7 +60,8 @@ def main(argv):
     with open(os.environ["FAKE_AUTOPILOT_LOG"], "a", encoding="utf-8") as f:
         f.write(json.dumps({"argv": argv, "cwd": os.getcwd(),
                             "autopilot": os.environ.get("CLAUDE_AUTOPILOT"),
-                            "handoff": os.environ.get("CLAUDE_AUTOPILOT_HANDOFF")}) + "\n")
+                            "handoff": os.environ.get("CLAUDE_AUTOPILOT_HANDOFF"),
+                            "session": os.environ.get("CLAUDE_AUTOPILOT_SESSION")}) + "\n")
     if n >= len(runs):
         return 1
     run = runs[n]

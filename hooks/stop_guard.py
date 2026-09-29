@@ -8,7 +8,9 @@ It blocks once per chain: when stop_hook_active is set, the stop goes through.
 Silent in subagents and on any error.
 
 When CLAUDE_AUTOPILOT=1 and the handoff named by CLAUDE_AUTOPILOT_HANDOFF says
-`Autopilot: continue`, the hook blocks the stop so the headless run dispatches
+`Autopilot: continue`, and the payload's session_id equals CLAUDE_AUTOPILOT_SESSION
+(both non-empty; a nested claude that inherits the environment has another id and
+is left alone), the hook blocks the stop so the headless run dispatches
 the next task. Once a block brings no progress (HEAD and the handoff's mtime
 unchanged since that session's previous block), it lets the stop through, and
 Claude Code's 8-continuation cap backs that up. The state lives in
@@ -52,6 +54,9 @@ def autopilot_block(session):
     handoff changed since this session's last block (so a block that brought no progress lets go)."""
     if os.environ.get("CLAUDE_AUTOPILOT") != "1":
         return False
+    bound = os.environ.get("CLAUDE_AUTOPILOT_SESSION") or ""
+    if not bound or not isinstance(session, str) or session != bound:
+        return False  # only the headless run itself, not a nested session that inherited the markers
     handoff = os.environ.get("CLAUDE_AUTOPILOT_HANDOFF") or ""
     if not os.path.isfile(handoff):
         return False

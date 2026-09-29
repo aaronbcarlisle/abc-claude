@@ -16,6 +16,7 @@ import sys
 import tempfile
 import time
 import unittest
+import uuid
 
 # `python -m unittest tests.test_autopilot` from the repo root doesn't put tests/ on sys.path.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -55,7 +56,7 @@ class AutopilotTest(unittest.TestCase):
                            FAKE_AUTOPILOT_COUNT=os.path.join(t, "count"), FAKE_AUTOPILOT_LOG=self.calls_file,
                            AUTOPILOT_STATE_DIR=self.state, AUTOPILOT_MAX_SLEEP_SECONDS="0",
                            CLAUDE_SESSIONS_DIR=self.sessions)
-        for key in ("CLAUDE_AUTOPILOT", "CLAUDE_AUTOPILOT_HANDOFF"):
+        for key in ("CLAUDE_AUTOPILOT", "CLAUDE_AUTOPILOT_HANDOFF", "CLAUDE_AUTOPILOT_SESSION"):
             self.env.pop(key, None)
         self.repo = os.path.join(t, "repo")
         os.makedirs(self.repo)
@@ -108,16 +109,60 @@ class AutopilotTest(unittest.TestCase):
         self.assertEqual(len(self.calls()), 1)
         self.assertRegex(self.last_line(), SUMMARY % ("done", 1, r"0\.50"))
 
+    def assertSessionId(self, call):
+        """The call's argv ends `--session-id <uuid>` and CLAUDE_AUTOPILOT_SESSION is that uuid; returns it."""
+        argv = call["argv"]
+        self.assertGreaterEqual(len(argv), 2, argv)
+        self.assertEqual(argv[-2], "--session-id", argv)
+        sid = argv[-1]
+        self.assertRegex(sid, r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+        self.assertEqual(str(uuid.UUID(sid)), sid)
+        self.assertEqual(call["session"], sid)
+        return sid
+
     def test_passes_the_headless_flags_and_environment(self):
         self.script(run(autopilot="done"))
         self.autopilot()
         call = self.calls()[0]
+        sid = self.assertSessionId(call)
         self.assertEqual(call["argv"], ["-p", "/resume autopilot", "--permission-mode", "auto",
                                         "--model", "opus", "--max-turns", "200", "--max-budget-usd", "25.00",
-                                        "--output-format", "stream-json", "--verbose"])
+                                        "--output-format", "stream-json", "--verbose", "--session-id", sid])
         self.assertEqual(call["autopilot"], "1")
         self.assertTrue(os.path.samefile(call["handoff"], self.handoff))
+        self.assertEqual(call["session"], sid)
         self.assertTrue(os.path.samefile(call["cwd"], self.repo))
+
+    def test_each_run_gets_its_own_session_id(self):
+        self.script(run(), run(), run(autopilot="done"))
+        proc = self.autopilot()
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        calls = self.calls()
+        self.assertEqual(len(calls), 3)
+        sids = [self.assertSessionId(call) for call in calls]
+        self.assertEqual(len(set(sids)), 3, sids)
+
+    def test_autopilot_environment_is_removed_after_the_runs(self):
+        # Run the script in the same pwsh process, then read that process's environment.
+        # A parent CLAUDE_AUTOPILOT_SESSION is overwritten for the run and gone afterwards.
+        self.env["CLAUDE_AUTOPILOT_SESSION"] = "outer-session"
+        self.script(run(), run(autopilot="done"))
+        quoted = lambda s: "'" + s.replace("'", "''") + "'"  # noqa: E731
+        command = ("& %s -Repo %s; "
+                   "$after = [ordered]@{ autopilot = $env:CLAUDE_AUTOPILOT; handoff = $env:CLAUDE_AUTOPILOT_HANDOFF; "
+                   "session = $env:CLAUDE_AUTOPILOT_SESSION }; "
+                   "Write-Output ('ENV-AFTER ' + ($after | ConvertTo-Json -Compress))") % (quoted(SCRIPT),
+                                                                                        quoted(self.repo))
+        proc = subprocess.run([PWSH, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command],
+                              cwd=self.tmp.name, env=self.env, capture_output=True, encoding="utf-8",
+                              errors="replace", timeout=300)
+        match = re.search(r"^ENV-AFTER (.*)$", proc.stdout, re.M)
+        self.assertIsNotNone(match, proc.stdout + proc.stderr)
+        calls = self.calls()
+        self.assertEqual(len(calls), 2, proc.stdout + proc.stderr)
+        self.assertEqual(json.loads(match.group(1)), {"autopilot": None, "handoff": None, "session": None})
+        for call in calls:
+            self.assertSessionId(call)
 
     def test_owner_or_missing_line_starts_no_run(self):
         for state, status in (("owner", "owner"), (None, "no-autopilot-line")):
@@ -398,12 +443,15 @@ class AutopilotTest(unittest.TestCase):
     def test_parent_autopilot_environment_is_overridden(self):
         self.env["CLAUDE_AUTOPILOT"] = "0"
         self.env["CLAUDE_AUTOPILOT_HANDOFF"] = os.path.join(self.tmp.name, "other", "SESSION_HANDOFF.md")
+        # A nested autopilot inherits the outer run's session id: its own run must not reuse it.
+        self.env["CLAUDE_AUTOPILOT_SESSION"] = str(uuid.uuid4())
         self.script(run(autopilot="done"))
         proc = self.autopilot()
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         call = self.calls()[0]
         self.assertEqual(call["autopilot"], "1")
         self.assertTrue(os.path.samefile(call["handoff"], self.handoff))
+        self.assertNotEqual(self.assertSessionId(call), self.env["CLAUDE_AUTOPILOT_SESSION"])
 
     # -- budget and run limits -------------------------------------------------------
 

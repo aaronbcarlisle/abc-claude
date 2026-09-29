@@ -35,6 +35,12 @@ Exit: 0 ended normally (done, owner, no Autopilot line, max runs); 1 stalled,
 budget, usage-limit or error; 2 refused (no such repo, not a git repo, live
 session, dirty tree).
 
+Each run gets a fresh UUID: it is passed as `--session-id <uuid>` (the last two
+arguments) and exported as CLAUDE_AUTOPILOT_SESSION next to CLAUDE_AUTOPILOT=1 and
+CLAUDE_AUTOPILOT_HANDOFF=<path>, so the Stop hook acts only in that session and not
+in a nested `claude` that inherits the environment. All three are removed after
+each run, including any value inherited from the caller.
+
 Test overrides: AUTOPILOT_STATE_DIR (log directory), AUTOPILOT_MAX_SLEEP_SECONDS
 (caps each usage-limit sleep), CLAUDE_SESSIONS_DIR (read by live_sessions.py).
 Tests: python -m unittest discover -s tests (from the repo root)
@@ -110,6 +116,7 @@ function Get-StateName($State) {
 }
 
 function Invoke-Run([double]$Remaining) {
+    $sessionId = [guid]::NewGuid().ToString()
     $argv = @(
         '-p', '/resume autopilot',
         '--permission-mode', 'auto',
@@ -117,11 +124,13 @@ function Invoke-Run([double]$Remaining) {
         '--max-turns', "$MaxTurns",
         '--max-budget-usd', $Remaining.ToString('0.00', $Invariant),
         '--output-format', 'stream-json',
-        '--verbose'
+        '--verbose',
+        '--session-id', $sessionId
     )
     $seen = @{ Result = $null; Limit = $null }
     $env:CLAUDE_AUTOPILOT = '1'
     $env:CLAUDE_AUTOPILOT_HANDOFF = $Handoff
+    $env:CLAUDE_AUTOPILOT_SESSION = $sessionId
     Push-Location -LiteralPath $Repo
     try {
         & claude @argv 2>&1 | ForEach-Object {
@@ -135,7 +144,7 @@ function Invoke-Run([double]$Remaining) {
     }
     finally {
         Pop-Location
-        Remove-Item Env:CLAUDE_AUTOPILOT, Env:CLAUDE_AUTOPILOT_HANDOFF -ErrorAction SilentlyContinue
+        Remove-Item Env:CLAUDE_AUTOPILOT, Env:CLAUDE_AUTOPILOT_HANDOFF, Env:CLAUDE_AUTOPILOT_SESSION -ErrorAction SilentlyContinue
     }
     return [pscustomobject]@{ Result = $seen.Result; Limit = $seen.Limit; Exit = $code }
 }

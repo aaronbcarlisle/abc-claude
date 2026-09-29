@@ -20,23 +20,39 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from stubs import git, git_env  # noqa: E402
 
 HOOK = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "hooks", "stop_guard.py")
+AUTOPILOT_KEYS = ("CLAUDE_AUTOPILOT", "CLAUDE_AUTOPILOT_HANDOFF", "CLAUDE_AUTOPILOT_SESSION")
 
 
 class StopGuardCase(unittest.TestCase):
+    # When True, each hook run is the autopilot's own session: CLAUDE_AUTOPILOT_SESSION is set
+    # to the payload's session_id (and removed when that id can't be an environment value).
+    # Tests that exercise a foreign or missing session set it False and manage the variable.
+    bind_session = False
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.env = dict(os.environ, STOP_GUARD_STATE_DIR=os.path.join(self.tmp.name, "state"))
-        for key in ("CLAUDE_AUTOPILOT", "CLAUDE_AUTOPILOT_HANDOFF"):
+        for key in AUTOPILOT_KEYS:
             self.env.pop(key, None)
 
     def tearDown(self):
         self.tmp.cleanup()
 
+    def hook_env(self, payload, env):
+        env = dict(env)
+        if self.bind_session:
+            sid = payload.get("session_id")
+            if isinstance(sid, str) and "\0" not in sid:
+                env["CLAUDE_AUTOPILOT_SESSION"] = sid
+            else:
+                env.pop("CLAUDE_AUTOPILOT_SESSION", None)
+        return env
+
     def run_hook(self, message="Done.", active=False, **extra):
         payload = {"session_id": "s1", "hook_event_name": "Stop", "stop_hook_active": active,
                    "last_assistant_message": message, **extra}
         proc = subprocess.run([sys.executable, HOOK], input=json.dumps(payload), capture_output=True,
-                              encoding="utf-8", env=self.env, timeout=20)
+                              encoding="utf-8", env=self.hook_env(payload, self.env), timeout=20)
         self.assertEqual((proc.returncode, proc.stderr), (0, ""))
         out = proc.stdout.strip()
         return json.loads(out) if out else None
@@ -66,12 +82,14 @@ class NoResponseTest(StopGuardCase):
 
 
 class AutopilotStopTest(StopGuardCase):
+    bind_session = True  # every run is the autopilot's own `claude -p --session-id` session
+
     def setUp(self):
         super().setUp()
         self.repo = os.path.join(self.tmp.name, "repo")
         os.makedirs(self.repo)
         self.env = git_env(self.tmp.name, STOP_GUARD_STATE_DIR=self.env["STOP_GUARD_STATE_DIR"])
-        for key in ("CLAUDE_AUTOPILOT", "CLAUDE_AUTOPILOT_HANDOFF"):
+        for key in AUTOPILOT_KEYS:
             self.env.pop(key, None)
         git(self.repo, self.env, "init", "-q", "-b", "main")
         self.commit("one")
@@ -136,6 +154,116 @@ class AutopilotStopTest(StopGuardCase):
         self.assertIn("continue the skill or task", out["reason"])
 
 
+class AutopilotSessionTest(StopGuardCase):
+    """The autopilot branch applies only to the session the autopilot started.
+
+    The autopilot runs `claude -p --session-id <uuid>` with CLAUDE_AUTOPILOT_SESSION=<uuid>.
+    A nested `claude` inherits all three variables but has its own session_id, so its Stop
+    must not be blocked. Each test first checks that the matching session blocks.
+    """
+
+    commit = AutopilotStopTest.commit
+    set_state = AutopilotStopTest.set_state
+    assertBlocks = AutopilotStopTest.assertBlocks
+
+    OUTER = "0b7c6f1e-3d2a-4c5b-9e8f-1a2b3c4d5e6f"
+    INNER = "7f3e2d1c-0b9a-4876-a543-210fedcba987"
+
+    def setUp(self):
+        super().setUp()
+        self.repo = os.path.join(self.tmp.name, "repo")
+        os.makedirs(self.repo)
+        self.env = git_env(self.tmp.name, STOP_GUARD_STATE_DIR=self.env["STOP_GUARD_STATE_DIR"])
+        for key in AUTOPILOT_KEYS:
+            self.env.pop(key, None)
+        git(self.repo, self.env, "init", "-q", "-b", "main")
+        self.commit("one")
+        self.handoff = os.path.join(self.repo, "SESSION_HANDOFF.md")
+        self.set_state("continue")
+        self.env.update(CLAUDE_AUTOPILOT="1", CLAUDE_AUTOPILOT_HANDOFF=self.handoff,
+                        CLAUDE_AUTOPILOT_SESSION=self.OUTER)
+
+    def run_payload(self, payload):
+        proc = subprocess.run([sys.executable, HOOK], input=json.dumps(payload), capture_output=True,
+                              encoding="utf-8", env=self.env, timeout=20)
+        self.assertEqual((proc.returncode, proc.stderr), (0, ""))
+        out = proc.stdout.strip()
+        return json.loads(out) if out else None
+
+    def assertControlBlocks(self):
+        # A fresh state dir each time, so the control's block record can't affect what follows.
+        self.env["STOP_GUARD_STATE_DIR"] = tempfile.mkdtemp(dir=self.tmp.name)
+        saved = self.env.get("CLAUDE_AUTOPILOT_SESSION")
+        self.env["CLAUDE_AUTOPILOT_SESSION"] = self.OUTER
+        self.assertBlocks(self.run_hook(session_id=self.OUTER))
+        if saved is None:
+            del self.env["CLAUDE_AUTOPILOT_SESSION"]
+        else:
+            self.env["CLAUDE_AUTOPILOT_SESSION"] = saved
+        self.env["STOP_GUARD_STATE_DIR"] = tempfile.mkdtemp(dir=self.tmp.name)
+
+    def test_matching_session_blocks_and_still_needs_progress(self):
+        self.assertBlocks(self.run_hook(session_id=self.OUTER))
+        self.assertIsNone(self.run_hook(active=True, session_id=self.OUTER))
+        # A nested session's stop in between doesn't count as the autopilot's.
+        self.assertBlocks(self.run_hook(session_id=self.OUTER))
+        self.assertIsNone(self.run_hook(session_id=self.INNER))
+        self.commit("two")
+        self.assertBlocks(self.run_hook(active=True, session_id=self.OUTER))
+
+    def test_nested_session_with_inherited_variables_does_not_block(self):
+        self.assertControlBlocks()
+        self.assertIsNone(self.run_hook(session_id=self.INNER))
+        self.assertIsNone(self.run_hook(active=True, session_id=self.INNER))
+
+    def test_session_id_must_match_exactly(self):
+        self.assertControlBlocks()
+        for sid in (self.OUTER[:-1], self.OUTER + "0", "x" + self.OUTER, " " + self.OUTER,
+                    self.OUTER + "\n", self.OUTER.replace("-", ""), "s1", "*", ".*"):
+            self.assertIsNone(self.run_hook(session_id=sid), repr(sid))
+
+    def test_missing_session_variable_does_not_block(self):
+        self.assertControlBlocks()
+        del self.env["CLAUDE_AUTOPILOT_SESSION"]
+        for sid in (self.OUTER, "s1", ""):
+            self.assertIsNone(self.run_hook(session_id=sid), repr(sid))
+
+    def test_empty_session_variable_does_not_block(self):
+        self.assertControlBlocks()
+        self.env["CLAUDE_AUTOPILOT_SESSION"] = ""
+        for sid in ("", self.OUTER, "s1"):
+            self.assertIsNone(self.run_hook(session_id=sid), repr(sid))
+        payload = {"hook_event_name": "Stop", "stop_hook_active": False, "last_assistant_message": "Done."}
+        self.assertIsNone(self.run_payload(payload))
+
+    def test_missing_payload_session_id_does_not_block(self):
+        self.assertControlBlocks()
+        payload = {"hook_event_name": "Stop", "stop_hook_active": False, "last_assistant_message": "Done."}
+        self.assertIsNone(self.run_payload(payload))
+        self.assertIsNone(self.run_payload(dict(payload, session_id=None)))
+        # A null id must not match a variable that happens to read "None" or "null".
+        for value in ("None", "null"):
+            self.env["CLAUDE_AUTOPILOT_SESSION"] = value
+            self.assertIsNone(self.run_payload(dict(payload, session_id=None)), value)
+
+    def test_nested_session_keeps_the_no_response_guard_only(self):
+        # In a foreign session a "No response requested" stop gets the plain guard: blocked once,
+        # then allowed in the active chain (the autopilot session would be blocked again there).
+        self.assertBlocks(self.run_hook("No response requested.", active=True, session_id=self.OUTER))
+        out = self.run_hook("No response requested.", session_id=self.INNER)
+        self.assertIsNotNone(out)
+        self.assertIn("continue the skill or task", out["reason"])
+        self.assertIsNone(self.run_hook("No response requested.", active=True, session_id=self.INNER))
+
+    def test_foreign_session_records_no_state(self):
+        # The autopilot branch doesn't run for a nested session, so it writes no block record.
+        state = self.env["STOP_GUARD_STATE_DIR"]
+        self.assertIsNone(self.run_hook(session_id=self.INNER))
+        self.assertFalse(os.path.isdir(state) and os.listdir(state),
+                         os.listdir(state) if os.path.isdir(state) else None)
+        self.assertBlocks(self.run_hook(session_id=self.OUTER))
+
+
 class AutopilotHostileTest(StopGuardCase):
     """Hostile inputs for the autopilot branch.
 
@@ -146,11 +274,12 @@ class AutopilotHostileTest(StopGuardCase):
     commit = AutopilotStopTest.commit
     set_state = AutopilotStopTest.set_state
     assertBlocks = AutopilotStopTest.assertBlocks
+    bind_session = True  # every run is the autopilot's own session
 
     def setUp(self):
         super().setUp()
         self.env = git_env(self.tmp.name, STOP_GUARD_STATE_DIR=self.env["STOP_GUARD_STATE_DIR"])
-        for key in ("CLAUDE_AUTOPILOT", "CLAUDE_AUTOPILOT_HANDOFF"):
+        for key in AUTOPILOT_KEYS:
             self.env.pop(key, None)
         self.use_repo(os.path.join(self.tmp.name, "repo"))
         self.env["CLAUDE_AUTOPILOT"] = "1"
@@ -191,7 +320,8 @@ class AutopilotHostileTest(StopGuardCase):
 
     def run_payload(self, payload, env=None, hook=None, cwd=None):
         proc = subprocess.run([sys.executable, hook or HOOK], input=json.dumps(payload), capture_output=True,
-                              encoding="utf-8", env=self.env if env is None else env, cwd=cwd, timeout=20)
+                              encoding="utf-8", env=self.hook_env(payload, self.env if env is None else env),
+                              cwd=cwd, timeout=20)
         self.assertEqual((proc.returncode, proc.stderr), (0, ""))
         out = proc.stdout.strip()
         return json.loads(out) if out else None
@@ -372,11 +502,13 @@ class AutopilotHostileTest(StopGuardCase):
         self.env["STOP_GUARD_STATE_DIR"] = state
         git_dir = os.path.join(self.repo, ".git")
         before = self.snapshot(state, git_dir)
-        for sid in ("../x", "..\\x", "a/b", "../../../../escape", "/abs", "C:\\abs", "a\u0000b",
+        # Each id is the autopilot session's own (bind_session), so each blocks once.
+        for sid in ("../x", "..\\x", "a/b", "../../../../escape", "/abs", "C:\\abs",
                     "s\u00e9ance-\u65e5\u672c", ".", "..", "$HOME%PATH%"):
             self.assertBlocks(self.run_hook(session_id=sid))
             self.assertIsNone(self.run_hook(active=True, session_id=sid), repr(sid))
-        for sid in ("", None, 7, ["x"], "x" * 5000):
+        # A NUL can't be in CLAUDE_AUTOPILOT_SESSION, so "a\0b" is never the autopilot session.
+        for sid in ("", None, 7, ["x"], "x" * 5000, "a\u0000b"):
             self.run_hook(session_id=sid)  # outcome unspecified; run_hook checks exit 0 and empty stderr
         self.run_payload({k: v for k, v in self.payload().items() if k != "session_id"})
         self.assertEqual(self.snapshot(state, git_dir), before)
