@@ -16,10 +16,12 @@ default or has none) is kept unless a merged PR contains its tip: it's new
 work that hasn't started. Checkouts with a live Claude Code session are
 skipped; --here exempts the caller's own checkout. A live main checkout
 refuses the run, unless --here, which skips it instead: no switch, pull or
-tests there. The caller's own worktree is never removed (a session can't remove the
-worktree it runs in), but when it has no tracked uncommitted changes it is detached
-at origin/<default> and its merged branch is deleted; otherwise the branch is kept. A worktree is removed only when it has no uncommitted or
-untracked files and no ignored session files (a handoff, .superpowers/, .env).
+tests there. The caller's own worktree is never removed (a session can't
+remove the worktree it runs in), but when it has no tracked uncommitted
+changes and no other live session, it is detached at origin/<default> and
+its merged branch is deleted; otherwise the branch is kept. Any other
+worktree is removed only when it has no uncommitted or untracked files and
+no ignored session files (a handoff, .superpowers/, .env).
 A failed switch or delete keeps that branch and the run goes on. Never
 commits and never pushes. --dry-run changes nothing (not even a fetch).
 
