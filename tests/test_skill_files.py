@@ -809,6 +809,7 @@ class AgentFilesTest(unittest.TestCase):
         text = body(self.agent("test-author"))
         self.assertIn("LOCKED FILES", text)
         self.assertIn("fail for the right reason", text)
+        self.assertNotIn("keep it and say why", text)
 
     def test_implementer_treats_locked_tests_as_read_only(self):
         self.assertIn("locked (from test-author) are read-only", body(self.agent("implementer")))

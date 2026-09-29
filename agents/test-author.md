@@ -38,7 +38,7 @@ Don't read the implementation bodies of the code under test, and don't mirror an
 ## Prove
 Run the test command. Every new test must fail, and fail for the right reason: an assertion, or a missing symbol, module or command that the task will add.
 - A syntax error, a broken fixture path or an import error in your own helpers is your bug. Fix it and re-run.
-- A new test that already passes is testing existing behaviour. Drop it, or keep it and say why.
+- A new test that already passes is testing existing behaviour, not the task. Drop it, or rewrite it to test the new behaviour so it fails. Report no passing tests.
 
 ## Commit
 Only when the dispatch says so:
