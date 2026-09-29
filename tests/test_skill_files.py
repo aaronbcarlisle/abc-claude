@@ -682,6 +682,12 @@ class FinalizeStackTest(unittest.TestCase):
         self.assertLess(carry, top)
         self.assertLess(step4.index("`<anchor>`"), carry)  # defined right before the command
         self.assertNotIn("<pre-triage tip of the lower PR>", step4)
+        definition = re.search(r"^.*`<anchor>` is .*$", step4, re.M).group(0)
+        self.assertIn("`<anchor>` is the lower PR's `<base-of-above>`", definition)
+        self.assertNotIn("remote SHA", definition)  # the lease value must not decide the carry-up
+        self.assertNotIn("changed during triage", step4)
+        self.assertIn("differs from `<base-of-above>` of the lower PR", step4)
+        self.assertIn("<base-of-above N>", body(skill("finalize-stack")))
         self.assertIn("moves only refs that point into the rebased range", step4)
         self.assertIn("until step 2 below has carried them up", step4)
 
@@ -706,7 +712,7 @@ class FinalizeStackTest(unittest.TestCase):
         self.assertIn("retarget of #<N> failed", text)
 
     def test_fix_commit_lookup_uses_fixed_strings(self):
-        self.assertIn("git log --format=%h -1 --fixed-strings --grep=<fix subject> <branch>",
+        self.assertIn('git log --format=%h -1 --fixed-strings --grep="<fix subject>" <branch>',
                       body(skill("finalize-stack")))
 
     def test_merge_checks_head_base_and_draft_and_retarget_fails_closed(self):

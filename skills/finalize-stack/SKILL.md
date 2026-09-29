@@ -65,7 +65,7 @@ STACK (bottom → top)
    - The local tip is an ancestor of the PR head: fast-forward with `git -C <path> merge --ff-only <headRefOid>` (after the fetch).
    - Anything else (local ahead or diverged): stop with "`<head>` in `<path>` doesn't match PR #<N>'s head: sync it, then re-run /finalize-stack".
 
-   Record each PR's head as `<pre-triage tip N>`. It's the first lease value (step 4.4) and the rebase anchor (step 4.2). Also track each branch's remote SHA: it starts as the PR's `headRefOid` from this step, and afterwards it changes only to a SHA this run itself pushed; a `git fetch` never updates it. A push rejected by its lease stops with "head moved on #<N>: re-run /finalize-stack".
+   Record each PR's head as `<pre-triage tip N>`. It's the first lease value (step 4.4). Also give each PR a `<base-of-above N>`: the SHA of that PR's branch that the PR directly above it was last built on; it starts as `<pre-triage tip N>` and is the carry-up's anchor (step 4.2). Also track each branch's remote SHA: it starts as the PR's `headRefOid` from this step, and afterwards it changes only to a SHA this run itself pushed; a `git fetch` never updates it. A push rejected by its lease stops with "head moved on #<N>: re-run /finalize-stack".
 3. For each PR, check for an unfinished review: a pending review request, or a check run named like `review` that hasn't completed on its head SHA.
    ```bash
    gh pr view <N> --json reviewRequests --jq '.reviewRequests | length'
@@ -93,16 +93,17 @@ Collect every `needs_owner` item across the stack and ask them in one batch: Ask
 ## 4. Restack
 `git rebase --update-refs` moves only refs that point into the rebased range, so a lower branch's new fix commits aren't in the upper branches until step 2 below has carried them up.
 1. `git rebase --update-refs` won't move a branch that's checked out in another worktree. In every PR's checkout except the top PR's, run `git switch --detach` first. This includes this checkout when it holds a lower branch; when it holds the top branch, it's the top PR's checkout and stays attached. A checkout re-attaches (`git -C <path> switch <branch>`) only for its own rebase in step 2, then detaches again.
-2. Carry lower fixes up, bottom to top. For each PR above the bottom whose lower PR's tip changed during triage (the lower branch's current tip differs from `<anchor>`), run this in that PR's checkout. `<anchor>` is the lower PR's `<pre-triage tip N>` on the first pass through step 4, and the lower branch's recorded remote SHA (the last SHA this run pushed for it) on any later pass:
+2. Carry lower fixes up, bottom to top. For each PR above the bottom whose lower branch's current tip differs from `<base-of-above>` of the lower PR (this holds on every pass), run this in that PR's checkout. `<anchor>` is the lower PR's `<base-of-above>`:
    `git rebase --onto <lower branch> <anchor> <this branch>`
+   Then set the lower PR's `<base-of-above>` to the lower tip the rebase used.
    Resolve conflicts as in step 3.
-3. In the top PR's checkout: `git rebase --update-refs origin/<default>`.
+3. In the top PR's checkout: `git rebase --update-refs origin/<default>`. Afterwards set each lower PR's `<base-of-above>` to its branch's new tip, since the branch above is built on it.
    - If the bottom PR was already squash-merged, cut its commits off instead: `git rebase --update-refs --onto origin/<default> <merged head SHA> <top-branch>`. Detect it with `gh pr view <base branch> --json number,state,headRefOid`: `state` is `MERGED`, and `<merged head SHA>` is its `headRefOid`. When the open bottom PR's base is still the merged branch, retarget it with `gh pr edit <N> --base <default>` (failure: stop with "retarget of #<N> failed") before step 5.1's base check.
    - Resolve conflicts, preserving both sides' intent. An ambiguous conflict means stop and ask.
 4. In each other PR's checkout, `git switch <its branch>`, then run the gates there. Push each branch with an explicit lease on the remote SHA this run last saw for it: `git push --force-with-lease=<branch>:<remote SHA> origin <branch>`. Note old → new SHA, and record the SHA pushed as the branch's new remote SHA for the next lease.
 5. For each PR, once its checks register, run `gh pr checks <N> --watch --interval 30` (Bash, `run_in_background`).
 6. After CI is green, follow pr-review-loop's thread protocol:
-   - reply with the fix's post-rebase short SHA (find it with `git log --format=%h -1 --fixed-strings --grep=<fix subject> <branch>`, or by matching the fix commit's subject), or `Declining — <reason>`;
+   - reply with the fix's post-rebase short SHA (find it with `git log --format=%h -1 --fixed-strings --grep="<fix subject>" <branch>`, or by matching the fix commit's subject), or `Declining — <reason>`;
    - then resolve;
    - post one comment per PR listing its PR-level items.
 
