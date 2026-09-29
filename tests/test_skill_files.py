@@ -641,13 +641,63 @@ class FinalizeStackTest(unittest.TestCase):
         for needle in ("--match-head-commit", "feedback query failed", "reviews still pending",
                        "<triage-time>", "timeout_ms: 180000", "blocked: review threads query failed",
                        "blocked: checks query failed", "head moved on #<N>: re-run /finalize-stack",
-                       "new feedback on #<N> since triage: re-run /finalize-stack",
+                       "new feedback on #<N> again after re-triage: re-run /finalize-stack",
                        "--json mergeCommit --jq .mergeCommit.oid",
                        "no checks reported on the '<branch>' branch"):
             self.assertIn(needle, text, needle)
         sleeping = [line for line in text.splitlines() if re.search(r"\bsleep\b", line)]
         self.assertEqual(len(sleeping), 1, sleeping)
         self.assertTrue(sleeping[0].strip().startswith("for i in 1 2 3; do sleep 30;"), sleeping)
+
+    def test_allowed_tools_are_exactly_the_reviewed_list(self):
+        cleanup = 'Bash(POST_MERGE_TEST_TIMEOUT=540 python "$HOME/.claude/scripts/post_merge_cleanup.py" --repo . --here'
+        expected = (["Bash(gh:*)", "Bash(git:*)", "Bash(npm:*)", "Bash(npx tsc *)", "Bash(pnpm:*)",
+                     "Bash(python -m unittest discover -s tests)",
+                     'Bash(bash "$HOME/.claude/skills/pr-review-loop/scripts/threads.sh" *)',
+                     'Bash(python "$HOME/.claude/scripts/live_sessions.py" *)', cleanup + ")"]
+                    + [cleanup + " --test '%s')" % t for t in ("python -m unittest discover -s tests",
+                                                              "npm test", "pnpm test")]
+                    + ["Monitor", "TaskStop", "Agent", "AskUserQuestion", "Skill", "Read", "Edit", "Write",
+                       "Grep", "Glob"])
+        self.assertEqual(frontmatter(skill("finalize-stack")).get("allowed-tools"), expected)
+
+    def test_force_pushes_carry_an_explicit_lease(self):
+        text = body(skill("finalize-stack"))
+        self.assertIn("--force-with-lease=<branch>:", text)
+        self.assertNotRegex(text, r"git push --force-with-lease origin")
+        self.assertNotRegex(text, r"--force-with-lease(?!=)[^\n]*origin|with `--force-with-lease`\.")
+
+    def test_checkouts_are_synced_with_the_pr_head_before_triage(self):
+        step2 = section(body(skill("finalize-stack")), "## 2. Triage in parallel")
+        self.assertIn("gh pr view <N> --json headRefOid --jq .headRefOid", step2)
+        self.assertIn("git -C <path> merge --ff-only <headRefOid>", step2)
+        self.assertIn("doesn't match PR #<N>'s head: sync it, then re-run /finalize-stack", step2)
+        self.assertIn("<pre-triage tip N>", step2)
+        self.assertIn("from that PR's checkout", step2)  # the Phase 4 wait reads `git rev-parse HEAD`
+
+    def test_restack_carries_lower_fixes_up_before_the_top_rebase(self):
+        step4 = section(body(skill("finalize-stack")), "## 4. Restack")
+        carry = step4.index("git rebase --onto <lower branch> <pre-triage tip of the lower PR> <this branch>")
+        top = step4.index("git rebase --update-refs origin/<default>")
+        self.assertLess(carry, top)
+        self.assertIn("moves only refs that point into the rebased range", step4)
+
+    def test_merge_checks_head_base_and_draft_and_retarget_fails_closed(self):
+        step5 = section(body(skill("finalize-stack")), "## 5. Merge bottom-up")
+        for needle in ("--json isDraft,baseRefName,headRefOid,mergeStateStatus", "#<N> base is <base>, not <default>",
+                       "#<N> is a draft", "retarget of #<next> failed",
+                       "the SHA this run last pushed for that branch"):
+            self.assertIn(needle, step5, needle)
+
+    def test_new_feedback_is_re_triaged_once_then_stops(self):
+        text = body(skill("finalize-stack"))
+        self.assertIn("again after re-triage", text)
+        self.assertIn("<triage-time N>", text)
+
+    def test_cleanup_reports_timeouts_and_kept_branches(self):
+        cleanup = section(body(skill("finalize-stack")), "## 6. Cleanup")
+        self.assertIn("timed out after 540 s", cleanup)
+        self.assertIn("checked out in this session's worktree", cleanup)
 
     def test_cleanup_runs_from_the_checkout_with_an_exact_command(self):
         cleanup = section(body(skill("finalize-stack")), "## 6. Cleanup")

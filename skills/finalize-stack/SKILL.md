@@ -42,7 +42,7 @@ Invoking this skill authorizes `git push --force-with-lease` of the stack's bran
 Stop cases: whenever this skill says to stop, report why and stop. Don't restack the rest, don't run the cleanup and don't run `/handoff log`.
 
 ## 1. Map the stack
-A chain starts at a PR whose base is the default branch; each next PR's base is the previous PR's head branch. Build every chain from "My open PRs".
+A chain starts at a PR whose base is the default branch, or whose base is a branch whose PR is already merged (that merged PR is the chain's "squash-merged bottom"); each next PR's base is the previous PR's head branch. Build every chain from "My open PRs".
 - `#N` in the arguments picks the chain holding it.
 - With more than one chain and none picked, ask which (AskUserQuestion).
 - A draft in the chain: ask whether to include it.
@@ -60,14 +60,19 @@ STACK (bottom → top)
    - **Its head branch is already checked out** (for example, the top branch is this checkout's current branch): use that checkout; don't add a worktree. It must be clean: `git -C <path> status --porcelain --untracked-files=no` prints nothing. Otherwise stop with "`<head>` is checked out in `<path>` with uncommitted changes; commit or stash them there, then re-run /finalize-stack". If it isn't this checkout and `python "$HOME/.claude/scripts/live_sessions.py" <path>` exits 1, stop with "another session is working in `<path>`".
    - **Otherwise:** `git worktree add <root>-s<N> <head-branch>`. The worktree is a sibling of the repo root at a short path, which avoids long-path failures. If the path exists, reuse it only when it's a clean worktree on that branch; otherwise stop and ask.
    Record each PR's checkout. "Its checkout" below means that path.
-3. Record `<triage-time>`: `date -u +%Y-%m-%dT%H:%M:%SZ`. Phase 1 feedback is read after this instant, and step 5 later looks for anything newer.
-4. For each PR, check for an unfinished review: a pending review request, or a check run named like `review` that hasn't completed on its head SHA.
+   Then sync each checkout with its PR: compare its tip (`git -C <path> rev-parse HEAD`) with `gh pr view <N> --json headRefOid --jq .headRefOid`.
+   - Equal: go on.
+   - The local tip is an ancestor of the PR head: fast-forward with `git -C <path> merge --ff-only <headRefOid>` (after the fetch).
+   - Anything else (local ahead or diverged): stop with "`<head>` in `<path>` doesn't match PR #<N>'s head: sync it, then re-run /finalize-stack".
+
+   Record each PR's head as `<pre-triage tip N>`. It's the first lease value (step 4.4) and the rebase anchor (step 4.2). Also track each branch's remote SHA: the SHA this run last saw on the remote for that branch, starting at `<pre-triage tip N>`.
+3. For each PR, check for an unfinished review: a pending review request, or a check run named like `review` that hasn't completed on its head SHA.
    ```bash
    gh pr view <N> --json reviewRequests --jq '.reviewRequests | length'
    gh api "repos/{owner}/{repo}/commits/<head SHA>/check-runs" --jq '[.check_runs[] | select((.name | test("review"; "i")) and .status != "completed")] | length'
    ```
-   If either prints more than `0`, run pr-review-loop's Phase 4 wait once for that PR (Monitor, `timeout_ms: 1500000`; the script and its rules are in that skill's Phase 4 step 2) with `since=<triage-time>`, before triaging it. If the wait prints `reviews still pending after 15 min`, `review status unknown: gh query failed` or `feedback query failed`, stop with "blocked: <that line> on #<N>". None of these counts as clean. If a query above fails, treat it as `review status unknown: gh query failed`.
-5. In one message, dispatch one agent per PR, in parallel. Use the repo's own implementer agent if it has one, otherwise `implementer`. Fill in this prompt:
+   If either prints more than `0`, run pr-review-loop's Phase 4 wait once for that PR (Monitor, `timeout_ms: 1500000`; the script and its rules are in that skill's Phase 4 step 2), before triaging it. Run it from that PR's checkout, because the script reads `git rev-parse HEAD`. Record `<triage-time>` (per PR: `<triage-time N>`) with `date -u +%Y-%m-%dT%H:%M:%SZ` right after that PR's wait ends, or here when it has no wait; never before the wait. The wait's own `since=` is the time it starts. Phase 1 reads everything up to `<triage-time N>`; step 5 later looks for anything newer. If the wait prints `reviews still pending after 15 min`, `review status unknown: gh query failed` or `feedback query failed`, stop with "blocked: <that line> on #<N>". None of these counts as clean. If a query above fails, treat it as `review status unknown: gh query failed`.
+4. In one message, dispatch one agent per PR, in parallel. Use the repo's own implementer agent if it has one, otherwise `implementer`. Fill in this prompt:
    ```
    Triage review feedback for PR #<N> (<head> -> <base>). Work only in <its checkout>.
    1. Read ~/.claude/skills/pr-review-loop/SKILL.md sections 1.1-1.4 and run them for PR #<N>
@@ -86,32 +91,38 @@ STACK (bottom → top)
 Collect every `needs_owner` item across the stack and ask them in one batch: AskUserQuestion allows up to 4 questions per call, so for more, make consecutive calls with nothing in between. Apply each ruling in its PR's checkout, run the gates and commit.
 
 ## 4. Restack
-1. `git rebase --update-refs` won't move a branch that's checked out in another worktree. In every PR's checkout except the top PR's, run `git switch --detach` first. This includes this checkout when it holds a lower branch; when it holds the top branch, it's the top PR's checkout and stays attached.
-2. In the top PR's checkout: `git rebase --update-refs origin/<default>`.
-   - If the bottom PR was already squash-merged, cut its commits off instead: `git rebase --update-refs --onto origin/<default> <merged head SHA> <top-branch>`.
+`git rebase --update-refs` moves only refs that point into the rebased range, so a lower branch's new fix commits aren't in the upper branches until step 3 below has carried them up.
+1. `git rebase --update-refs` won't move a branch that's checked out in another worktree. In every PR's checkout except the top PR's, run `git switch --detach` first. This includes this checkout when it holds a lower branch; when it holds the top branch, it's the top PR's checkout and stays attached. A checkout re-attaches (`git -C <path> switch <branch>`) only for its own rebase in step 2, then detaches again.
+2. Carry lower fixes up, bottom to top. For each PR above the bottom whose lower PR's tip changed during triage (the lower branch's current tip differs from `<anchor>`: the lower PR's `<pre-triage tip N>` on the first pass, its recorded remote SHA on a re-run), run this in that PR's checkout:
+   `git rebase --onto <lower branch> <pre-triage tip of the lower PR> <this branch>`
+   Resolve conflicts as in step 3.
+3. In the top PR's checkout: `git rebase --update-refs origin/<default>`.
+   - If the bottom PR was already squash-merged, cut its commits off instead: `git rebase --update-refs --onto origin/<default> <merged head SHA> <top-branch>`. Detect it with `gh pr view <N> --json state,headRefOid`: `state` is `MERGED`, and `<merged head SHA>` is its `headRefOid`.
    - Resolve conflicts, preserving both sides' intent. An ambiguous conflict means stop and ask.
-3. In each other PR's checkout, `git switch <its branch>`, then run the gates there.
-4. Push each branch with `git push --force-with-lease origin <branch>` and note old → new SHA.
+4. In each other PR's checkout, `git switch <its branch>`, then run the gates there. Push each branch with an explicit lease on the remote SHA this run last saw for it: `git push --force-with-lease=<branch>:<remote SHA> origin <branch>`. Note old → new SHA, and record the SHA pushed as the branch's new remote SHA for the next lease.
 5. For each PR, once its checks register, run `gh pr checks <N> --watch --interval 30` (Bash, `run_in_background`).
 6. After CI is green, follow pr-review-loop's thread protocol:
-   - reply with the fix's post-rebase short SHA, or `Declining — <reason>`;
+   - reply with the fix's post-rebase short SHA (find it with `git log --format=%h -1 --grep=<fix subject> <branch>`, or by matching the fix commit's subject), or `Declining — <reason>`;
    - then resolve;
    - post one comment per PR listing its PR-level items.
+
+   Red CI on a PR goes to that PR's triage agent as a fix (you dispatch it: the step 2.4 prompt, that PR's checkout only, naming the failing check). At most two attempts per PR, then stop and ask.
 
 ## 5. Merge bottom-up
 For the bottom PR, whose base is the default branch:
 1. Check, fresh, right before the merge:
+   - **State:** `gh pr view <N> --json isDraft,baseRefName,headRefOid,mergeStateStatus`. `baseRefName` must equal `<default>` and `isDraft` must be false; otherwise stop with "#<N> base is <base>, not <default>" or "#<N> is a draft". `headRefOid` must equal the SHA this run last pushed for that branch, or its `<pre-triage tip N>` if it was never pushed; on a mismatch, stop with "head moved on #<N>: re-run /finalize-stack".
    - **Checks:** `gh pr checks <N> --json bucket --jq '[.[] | select(.bucket != "pass" and .bucket != "skipping")] | length'` prints `0`. If it fails with `no checks reported on the '<branch>' branch`, the repo runs no CI on this PR: count it as `0`. Any other failure is a failed query: run it once more, and if it fails again, stop with "blocked: checks query failed". Drop `| length` to tell pending checks from failing ones: pending checks mean waiting for CI with `gh pr checks <N> --watch --interval 30` in the background (Bash, `run_in_background`), then re-check everything.
    - **Threads:** `bash "$HOME/.claude/skills/pr-review-loop/scripts/threads.sh" <N>` exits 0 and prints nothing. A non-zero exit is a failed query, not "no threads": run it once more, and if it fails again, stop with "blocked: review threads query failed".
-   - **No feedback since triage:** check for feedback posted or edited after `<triage-time>` by anyone but me (`<me>` is `gh api user --jq .login`). These are pr-review-loop Phase 4's three `events()` queries with `since=<triage-time>`:
+   - **No feedback since triage:** check for feedback posted or edited after `<triage-time N>` by anyone but me (`<me>` is `gh api user --jq .login`). These are pr-review-loop Phase 4's three `events()` queries with `since=<triage-time N>`:
      ```bash
-     since=<triage-time>
+     since=<triage-time N>
      gh api "repos/{owner}/{repo}/pulls/<N>/reviews" --jq ".[] | select(.submitted_at > \"$since\" and .user.login != \"<me>\") | \"review \(.id) by \(.user.login)\"" || echo "feedback query failed"
      gh api "repos/{owner}/{repo}/pulls/<N>/comments?since=$since" --jq ".[] | select(.user.login != \"<me>\") | \"inline \(.id) by \(.user.login) at \(.updated_at)\"" || echo "feedback query failed"
      gh api "repos/{owner}/{repo}/issues/<N>/comments?since=$since" --jq ".[] | select(.user.login != \"<me>\") | \"comment \(.id) by \(.user.login) at \(.updated_at)\"" || echo "feedback query failed"
      ```
-     Any review, inline or comment line means new feedback arrived after triage: stop with "new feedback on #<N> since triage: re-run /finalize-stack". A `feedback query failed` line isn't clean either: stop with "blocked: feedback query failed on #<N>".
-   - **Merge state:** `gh pr view <N> --json mergeStateStatus --jq .mergeStateStatus` is `CLEAN`. On `UNKNOWN`, re-query with the **Monitor** tool, never a foreground wait (`timeout_ms: 180000`; it prints the state every 30 s, up to 3 times, and exits once it isn't `UNKNOWN`):
+     A `feedback query failed` line isn't clean: stop with "blocked: feedback query failed on #<N>". Any review, inline or comment line is new feedback that arrived after triage. The first time on #<N>, don't stop the run: dispatch that PR's triage agent once more (the step 2.4 prompt, working only in that PR's checkout, told to handle the listed items), re-run step 4 for #<N> and the PRs above it, take a fresh `<triage-time N>`, and re-check this list. A second batch of new feedback on the same PR stops with "new feedback on #<N> again after re-triage: re-run /finalize-stack".
+   - **Merge state:** `mergeStateStatus` is `CLEAN`. On `UNKNOWN`, re-query with the **Monitor** tool, never a foreground wait (`timeout_ms: 180000`; it prints the state every 30 s, up to 3 times, and exits once it isn't `UNKNOWN`):
      ```bash
      for i in 1 2 3; do sleep 30; s=$(gh pr view <N> --json mergeStateStatus --jq .mergeStateStatus); echo "$s"; [ "$s" != UNKNOWN ] && break; done
      ```
@@ -122,9 +133,9 @@ For the bottom PR, whose base is the default branch:
    ```
    - If it exits non-zero, run `gh pr view <N> --json headRefOid --jq .headRefOid`. If it no longer equals `<head>`, the head moved: stop with "head moved on #<N>: re-run /finalize-stack". Otherwise report the error and stop.
    - After a merge, read the merge SHA: `gh pr view <N> --json mergeCommit --jq .mergeCommit.oid`. If it prints nothing or `null`, the merge isn't confirmed: stop.
-3. `git fetch origin`. Detach every remaining PR's checkout except the top PR's. In the top PR's checkout, run `git rebase --update-refs --onto origin/<default> <merged head SHA> <top-branch>`. Re-attach, run the gates, and push each remaining branch with `--force-with-lease`.
-4. `gh pr view <next> --json baseRefName --jq .baseRefName`. GitHub retargets the next PR when the merged branch is deleted; if it didn't, run `gh pr edit <next> --base <default>`.
-5. Wait for green CI on the next PR. Don't wait for bot re-reviews: fix commits get the gates only. Repeat from step 1 until the stack is merged.
+3. `git fetch origin`. Detach every remaining PR's checkout except the top PR's. In the top PR's checkout, run `git rebase --update-refs --onto origin/<default> <merged head SHA> <top-branch>`. Re-attach each remaining PR's checkout with `git -C <path> switch <branch>`, run the gates, and push each remaining branch with `git push --force-with-lease=<branch>:<remote SHA> origin <branch>`, recording the SHA pushed as its new remote SHA.
+4. `gh pr view <next> --json baseRefName --jq .baseRefName`. GitHub retargets the next PR when the merged branch is deleted; if it didn't, run `gh pr edit <next> --base <default>`. A failed or empty `baseRefName` query, or a failed `gh pr edit --base`, stops with "retarget of #<next> failed".
+5. Wait for green CI on the next PR: `gh pr checks <N> --watch --interval 30` in the background, then re-check. Red CI goes to that PR's triage agent as a fix (at most two attempts per PR, then stop). Don't wait for bot re-reviews: fix commits get the gates only. Repeat from step 1 until the stack is merged.
 
 Stop and ask when a conflict is ambiguous, or when CI still fails on a branch after two fix attempts.
 
@@ -137,9 +148,10 @@ Run it from the checkout this skill was invoked in (the repo root the context sh
 Any other gate test command is passed single-quoted, as `--test '<gate test command>'`, with double quotes only inside it: on Windows the script runs it through cmd.exe, so no `$VAR`, `'…'`, `~` or `2>/dev/null`. A `package.json` only in a subfolder keeps the `npm --prefix <dir> test` form. That run goes through the normal permission check.
 
 Run it with the Bash tool's `timeout: 600000`, and never start a second run. It removes the clean `-s<N>` worktrees and deletes the merged branches. Since PR #17, a merged branch checked out in this checkout is deleted after the checkout is detached at origin/<default>; its note says to start the next branch with `git switch -c`. Read the exit code and output as pr-review-loop Phase 6 does:
-- Exit 1 is `tests: fail`: report it first, in bold, with the output tail.
+- Exit 1 is `tests: fail`: report it first, in bold, with the output tail. If the tail ends `timed out after 540 s`, say the tests timed out instead.
 - Exit 2 is refused or failed: report the line as printed, with what was already deleted or kept.
-- Exit 0 with `tests: skipped` isn't a failure: report its `note:`.
+- Exit 0 with `tests: skipped` isn't a failure. Report the `note:` that says why: a live session or uncommitted changes in the main checkout, main not on the default branch, or pull failed. Without `--test` there is no note: the tests are always skipped.
+- A kept branch `checked out in this session's worktree` is expected; tell the owner to remove that worktree after the session ends.
 
 If `SESSION_HANDOFF.md` exists, run `/handoff log`.
 
