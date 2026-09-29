@@ -86,6 +86,7 @@ The exit code is 1 on a fatal error and 0 otherwise, including runs with warning
 - `python ~/.claude/scripts/post_merge_cleanup.py --repo . --here [--test CMD] [--dry-run]` deletes merged branches and their clean worktrees. It fast-forwards the default branch only in a clean main checkout that's on that branch and has no other live session. It runs `--test` only after that pull, and it logs to `SESSION_HANDOFF.md` only when that file exists. The ship loop runs it after each merge.
 - `hooks/pr_created.py`: after a non-draft `gh pr create` outside `/ship`, it tells Claude to hand the PR to the ship loop.
 - `hooks/stop_guard.py`: it blocks the first stop whose whole final message is "No response requested" (how a turn dies right after a skill loads). A second stop in the same chain goes through.
+- `pwsh ~/.claude/scripts/autopilot.ps1 -Repo <path> [-MaxRuns 6] [-MaxTurns 200] [-BudgetUsd 25]` continues a phase overnight in headless runs while the repo's `SESSION_HANDOFF.md` says `Autopilot: continue`, and refuses while a live session is in that checkout. Logs go to `~/.claude/state/autopilot/`.
 
 ## Tests
 

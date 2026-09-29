@@ -791,6 +791,21 @@ class FinalizeStackTest(unittest.TestCase):
             self.assertIn(rule[len("Bash("):-1], cleanup, rule)
 
 
+class AutopilotSkillsTest(unittest.TestCase):
+    def test_handoff_writes_the_autopilot_line(self):
+        text = body(skill("handoff"))
+        self.assertIn("`Autopilot: <state>`", text)
+        for state in ("`continue`", "`owner`", "`done`"):
+            self.assertIn(state, text)
+        self.assertIn("owner checklist", text)
+
+    def test_resume_has_a_headless_autopilot_mode(self):
+        self.assertIn("autopilot", frontmatter(skill("resume")).get("argument-hint", ""))
+        text = body(skill("resume"))
+        self.assertIn("never stop to ask", text)
+        self.assertIn("`Autopilot: owner`", text)
+
+
 class AgentFilesTest(unittest.TestCase):
     def agent(self, name):
         return os.path.join(REPO, "agents", name + ".md")
