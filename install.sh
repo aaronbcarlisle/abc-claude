@@ -276,11 +276,13 @@ restore_missing() {
 update_existing() {
     info "$TARGET is an abc-claude checkout - updating it."
     info "Close running Claude Code sessions first: they can hold files open."
-    restore_missing
+    # --force restores missing files with its reset, and must change nothing
+    # when the remote is unreachable, so it skips restore_missing.
     if [ "$FORCE" = 1 ]; then
         force_update
         return 0
     fi
+    restore_missing
     if [ -n "$(git -C "$TARGET" status --porcelain --untracked-files=no)" ]; then
         warn "Tracked files in $TARGET have local changes - skipping the pull. Commit or discard them, or re-run with --force to back them up and replace them."
         return 0

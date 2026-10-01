@@ -262,11 +262,13 @@ function Update-Existing($Origin) {
     $T = $script:Target
     Write-Info "$T is an abc-claude checkout - updating it."
     Write-Info 'Close running Claude Code sessions first: they can hold files open.'
-    Restore-Missing
+    # -Force restores missing files with its reset, and must change nothing
+    # when the remote is unreachable, so it skips Restore-Missing.
     if ($Force) {
         Invoke-ForceUpdate $Origin
         return
     }
+    Restore-Missing
     $dirty =@(Invoke-Quiet 'git' @('-C', $T, 'status', '--porcelain', '--untracked-files=no') | Where-Object { $_ })
     if ($dirty.Count -gt 0) {
         Write-Warn "Tracked files in $T have local changes - skipping the pull. Commit or discard them, or re-run with -Force to back them up and replace them."

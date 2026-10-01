@@ -229,6 +229,7 @@ class InstallerScenarios:
         self.assertOk(self.install("--yes"))
         t = self.sb.target
         (t / "CLAUDE.md").write_bytes(b"# My local edit\n")
+        (t / "rules" / "dev-tooling.md").unlink()
         head = self.target_git("rev-parse", "HEAD")
         self.sb.remote.rename(self.sb.root / "remote-away.git")
         before = h.snapshot(t)
@@ -238,6 +239,8 @@ class InstallerScenarios:
         self.assertEqual(self.target_git("rev-parse", "HEAD"), head)
         self.assertEqual(h.backups(t), [])
         self.assertEqual((t / "CLAUDE.md").read_bytes(), b"# My local edit\n")
+        self.assertFalse((t / "rules" / "dev-tooling.md").exists())
+        self.assertNotIn("Restored", result.output)
         worktree = lambda snap: {k: v for k, v in snap.items() if not k.startswith(".git/")}
         self.assertEqual(worktree(h.snapshot(t)), worktree(before))
 
