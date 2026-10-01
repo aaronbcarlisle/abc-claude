@@ -85,6 +85,9 @@ The exit code is 1 on a fatal error and 0 otherwise, including runs with warning
 - To opt a PR out of the auto-merge, open it with `--draft` or give it the `no-automerge` label.
 - `python ~/.claude/scripts/post_merge_cleanup.py --repo . --here [--test CMD] [--dry-run]` deletes merged branches and their clean worktrees. It fast-forwards the default branch only in a clean main checkout that's on that branch and has no other live session. It runs `--test` only after that pull, and it logs to `SESSION_HANDOFF.md` only when that file exists. The ship loop runs it after each merge.
 - `hooks/pr_created.py`: after a non-draft `gh pr create` outside `/ship`, it tells Claude to hand the PR to the ship loop.
+- `hooks/bash_guard.py`: blocks a push to the default branch, a plain force-push (`--force-with-lease` is fine), a merge while the PR's checks are red or pending, heredoc file writes and AI attribution.
+- `hooks/session_start.py`: at session start, resume and compaction, prints the head and newest Progress Log lines of the project's `SESSION_HANDOFF.md`, if there is one.
+- `hooks/line_endings.py`: after an Edit or Write, flags CRLF left in a file whose `.gitattributes` eol is `lf`.
 - `hooks/stop_guard.py`: it blocks the first stop whose whole final message is "No response requested" (how a turn dies right after a skill loads). A second stop in the same chain goes through.
 - `pwsh ~/.claude/scripts/autopilot.ps1 -Repo <path> [-MaxRuns 6] [-MaxTurns 200] [-BudgetUsd 25] [-Model opus]` continues a phase overnight in headless runs while the repo's `SESSION_HANDOFF.md` says `Autopilot: continue`, and refuses while a live session is in that checkout. Logs go to `~/.claude/state/autopilot/`.
 

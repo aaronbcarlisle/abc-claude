@@ -2,7 +2,7 @@
 """
 Bash guard hook (PreToolUse, Bash and PowerShell tools).
 
-Enforces two global rules from CLAUDE.md that prose alone didn't hold:
+Enforces global rules from CLAUDE.md that prose alone didn't hold:
 
   1. Never push to the default branch. Blocks a `git push` that would update
      the remote's default branch (`refs/remotes/<remote>/HEAD`; `main` and
@@ -29,6 +29,13 @@ Enforces two global rules from CLAUDE.md that prose alone didn't hold:
      variable set earlier in the command. An `-F`/`--body-file`/`--notes-file`
      file is read relative to the command's modeled cwd. Piped stdin, `$(cat
      file)`, `$'...'` and an unreadable file are allowed.
+  4. No plain force-push. Blocks `git push` with `--force`, `-f` (also in a
+     cluster like `-uf`) or a `+refspec`; `--force-with-lease` is allowed, so a
+     stack can still be restacked.
+  5. No merge over red CI. Blocks `gh pr merge` (unless `--auto`, which GitHub
+     holds for required checks) and a non-GET `gh api` call to `pulls/N/merge`
+     or `merge-async` while `gh pr checks` reports a failing or pending check.
+     A PR with no checks at all, or no `gh` on PATH, is allowed.
 
 Commands are tokenized (quotes, escapes, comments and heredoc bodies handled;
 PowerShell escapes with a backtick, so its Windows paths keep their
@@ -48,6 +55,7 @@ import fnmatch
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 
@@ -86,6 +94,15 @@ PUSH_MESSAGE = (
     "PUSH BLOCKED by bash_guard hook: this push would update the default branch "
     "`{branch}`. Push a feature branch and open a PR instead (global rule in "
     "~/.claude/CLAUDE.md).\n"
+)
+FORCE_MESSAGE = (
+    "PUSH BLOCKED by bash_guard hook: plain force-push. Use `git push "
+    "--force-with-lease --force-if-includes`, which refuses to overwrite commits "
+    "you haven't fetched.\n"
+)
+MERGE_MESSAGE = (
+    "MERGE BLOCKED by bash_guard hook: PR checks are failing or still pending. "
+    "Wait for them to finish green, then retry. `gh pr checks` output:\n\n{output}\n"
 )
 HEREDOC_MESSAGE = (
     "BLOCKED by bash_guard hook: write multi-line file content with the Write "
@@ -128,6 +145,11 @@ GH_RELEASE_ACTIONS = {"create", "new", "edit"}
 # gh options that may come before or between the command words, with their value.
 GH_GLOBAL_WITH_ARG = {"-R", "--repo"}
 GH_API_FIELD_FLAGS = ("-f", "-F", "--field", "--raw-field")
+# `gh pr merge` options that take their value as the NEXT token.
+MERGE_OPT_WITH_ARG = {"-t", "--subject", "-b", "--body", "-F", "--body-file",
+                      "-A", "--author-email", "--match-head-commit", "-R", "--repo"}
+MERGE_ENDPOINT = re.compile(r"(?:^|/)repos/([^/]+/[^/]+)/pulls/(\d+)/merge(?:-async)?/?$"
+                            r"|(?:^|/)pulls/(\d+)/merge(?:-async)?/?$")
 
 
 def git(args, cwd, opts=()):
@@ -399,6 +421,83 @@ def push_target(cwd, opts, args):
         if branch:
             return branch
     return None
+
+
+def push_forced(args):
+    """True if this `git push` forces without a lease: `--force`, `-f` (also in a
+    short cluster like `-uf`) or a `+refspec`. `--force-with-lease` is allowed."""
+    positional, k = [], 0
+    while k < len(args):
+        a = args[k]
+        if a in PUSH_OPT_WITH_ARG or is_redirect(a):
+            k += 2
+            continue
+        if a == "--force" or (a[:1] == "-" and a[:2] != "--" and "f" in a[1:]):
+            return True
+        if not a.startswith("-"):
+            positional.append(a)
+        k += 1
+    return any(r.startswith("+") for r in positional[1:])
+
+
+def merge_target(toks):
+    """(PR selector, repo or None) when `toks` merges a PR without `--auto`, else None.
+    Covers `gh pr merge` and the REST `pulls/N/merge` and `merge-async` endpoints."""
+    if os.path.basename(toks[0]).lower() not in ("gh", "gh.exe") or len(toks) < 3:
+        return None
+    if [t.lower() for t in toks[1:3]] == ["pr", "merge"]:
+        args, selector, repo, k = toks[3:], "", None, 0
+        if "--auto" in args:
+            return None  # `--auto` only arms auto-merge; GitHub waits for required checks
+        while k < len(args):
+            if args[k] in MERGE_OPT_WITH_ARG or is_redirect(args[k]):
+                if args[k] in GH_GLOBAL_WITH_ARG and k + 1 < len(args):
+                    repo = args[k + 1]
+                k += 2
+                continue
+            if not args[k].startswith("-") and not selector:
+                selector = args[k]
+            k += 1
+        return selector, repo
+    if toks[1].lower() == "api":
+        method, has_fields, endpoint, k = None, False, None, 2
+        while k < len(toks):
+            t = toks[k]
+            if t in ("-X", "--method") and k + 1 < len(toks):
+                method, k = toks[k + 1].upper(), k + 2
+                continue
+            if t.startswith("--method="):
+                method = t.split("=", 1)[1].upper()
+            elif t in GH_API_FIELD_FLAGS + ("--input",) or is_redirect(t):
+                has_fields = has_fields or not is_redirect(t)
+                k += 2
+                continue
+            elif not t.startswith("-") and endpoint is None:
+                endpoint = t
+            k += 1
+        if (method or ("POST" if has_fields else "GET")) == "GET" or not endpoint:
+            return None
+        m = MERGE_ENDPOINT.search(endpoint)
+        if m:
+            repo = m.group(1)
+            if repo and "{" in repo:
+                repo = None  # `{owner}/{repo}` placeholders mean the current repo
+            return (m.group(2) or m.group(3)), repo
+    return None
+
+
+def red_checks(cwd, selector, repo):
+    """`gh pr checks` output when the PR's checks are failing or pending, else None.
+    A repo that runs no CI on the PR counts as green."""
+    exe = shutil.which("gh")
+    if not exe:
+        return None
+    cmd = [exe, "pr", "checks"] + ([selector] if selector else []) + (["-R", repo] if repo else [])
+    r = subprocess.run(cmd, cwd=cwd, capture_output=True, encoding="utf-8", errors="replace", timeout=60)
+    out = (r.stdout + r.stderr).strip()
+    if r.returncode == 0 or "no checks reported" in out:
+        return None
+    return out[-3000:]
 
 
 def statements(toks):
@@ -677,6 +776,16 @@ def main():
                     branch = push_target(*call)
                     if branch:
                         sys.stderr.write(PUSH_MESSAGE.format(branch=branch))
+                        return 2
+                    if push_forced(call[2]):
+                        sys.stderr.write(FORCE_MESSAGE)
+                        return 2
+            if "merge" in cmd:
+                target = merge_target(seg)
+                if target:
+                    output = red_checks(cwd, *target)
+                    if output:
+                        sys.stderr.write(MERGE_MESSAGE.format(output=output))
                         return 2
     except Exception:
         return 0  # fail open

@@ -23,10 +23,10 @@ def git(*args, cwd):
                    capture_output=True, encoding="utf-8")
 
 
-def run_hook(command, cwd, tool="Bash"):
+def run_hook(command, cwd, tool="Bash", env=None):
     payload = json.dumps({"tool_name": tool, "tool_input": {"command": command}, "cwd": cwd})
     proc = subprocess.run([sys.executable, HOOK], input=payload, capture_output=True,
-                          encoding="utf-8", timeout=60)
+                          encoding="utf-8", timeout=60, env=env)
     return proc.returncode, proc.stderr
 
 
@@ -146,6 +146,99 @@ class PushGuardTest(unittest.TestCase):
         for cmd in ('echo "git push origin main"', 'git commit -m "never git push origin main"',
                     "python - <<'EOF'\nprint('git push origin main')\nEOF"):
             self.assertAllowed(cmd, self.main_repo)
+
+
+class ForceGuardTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        cls.repo = make_clone(cls.tmp.name, "forcerepo", "main")
+        git("checkout", "-q", "-b", "feat/x", cwd=cls.repo)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
+
+    def test_plain_force_pushes_are_blocked(self):
+        for cmd in ("git push --force origin feat/x", "git push -f", "git push -uf origin feat/x",
+                    "git push origin +feat/x", "git push origin +HEAD:feat/x",
+                    "git -C . push --force"):
+            code, err = run_hook(cmd, self.repo)
+            self.assertEqual(code, 2, cmd)
+            self.assertIn("--force-with-lease", err, cmd)
+        code, _ = run_hook("git push --force origin feat/x", self.repo, tool="PowerShell")
+        self.assertEqual(code, 2)
+
+    def test_lease_pushes_and_lookalikes_are_allowed(self):
+        for cmd in ("git push --force-with-lease origin feat/x",
+                    "git push --force-with-lease --force-if-includes origin feat/x",
+                    "git push --force-with-lease=feat/x:abc123 origin feat/x",
+                    "git push -o ci.skip origin feat/x", "git push origin ^feat/old feat/x",
+                    'echo "git push --force"', "git fetch -f origin"):
+            self.assertEqual(run_hook(cmd, self.repo), (0, ""), cmd)
+
+
+class MergeGuardTest(unittest.TestCase):
+    FAKE_GH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fake_gh.py")
+
+    def setUp(self):
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from stubs import install_stub
+        self.tmp = tempfile.TemporaryDirectory()
+        bin_dir = os.path.join(self.tmp.name, "bin")
+        install_stub(bin_dir, "gh", self.FAKE_GH)
+        self.state = os.path.join(self.tmp.name, "gh.json")
+        self.log = os.path.join(self.tmp.name, "gh.log")
+        self.env = dict(os.environ, FAKE_GH_STATE=self.state, FAKE_GH_LOG=self.log,
+                        PATH=bin_dir + os.pathsep + os.environ.get("PATH", ""))
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def checks(self, exit=0, stdout="", stderr=""):
+        with open(self.state, "w", encoding="utf-8") as f:
+            json.dump({"checks": {"exit": exit, "stdout": stdout, "stderr": stderr}}, f)
+
+    def calls(self):
+        if not os.path.exists(self.log):
+            return []
+        with open(self.log, encoding="utf-8") as f:
+            return f.read().splitlines()
+
+    def hook(self, command, tool="Bash"):
+        return run_hook(command, self.tmp.name, tool, env=self.env)
+
+    def test_merge_over_red_or_pending_checks_is_blocked(self):
+        for code in (1, 8):  # failed, pending
+            self.checks(exit=code, stdout="build\tfail\t1m\thttps://example.com/run\n")
+            got, err = self.hook("gh pr merge --squash --match-head-commit abc123 12")
+            self.assertEqual(got, 2, code)
+            self.assertIn("MERGE BLOCKED", err)
+            self.assertIn("build", err)
+        self.assertIn("pr checks 12", self.calls())
+
+    def test_merge_over_green_checks_is_allowed(self):
+        self.checks(exit=0, stdout="build\tpass\t1m\n")
+        self.assertEqual(self.hook("gh pr merge --squash --match-head-commit abc123 12"), (0, ""))
+        self.assertEqual(self.hook("gh pr merge 12 --squash", tool="PowerShell"), (0, ""))
+
+    def test_repo_without_ci_is_allowed(self):
+        self.checks(exit=1, stderr="no checks reported on the 'feat/x' branch\n")
+        self.assertEqual(self.hook("gh pr merge --squash 12"), (0, ""))
+
+    def test_rest_merge_endpoints_are_checked_against_their_repo(self):
+        self.checks(exit=1, stdout="lint\tfail\n")
+        for cmd in ("gh api -X PUT repos/o/r/pulls/7/merge-async -f merge_method=squash",
+                    "gh api --method PUT repos/o/r/pulls/7/merge"):
+            self.assertEqual(self.hook(cmd)[0], 2, cmd)
+        self.assertIn("pr checks 7 -R o/r", self.calls())
+
+    def test_auto_merge_and_reads_are_not_checked(self):
+        self.checks(exit=1, stdout="lint\tfail\n")
+        for cmd in ("gh pr merge --auto --squash 12", "gh api repos/o/r/pulls/7/merge",
+                    "gh pr view 12", 'echo "gh pr merge 12"'):
+            self.assertEqual(self.hook(cmd), (0, ""), cmd)
+        self.assertEqual(self.calls(), [])
 
 
 class HeredocGuardTest(unittest.TestCase):

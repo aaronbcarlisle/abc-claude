@@ -4,7 +4,7 @@ Answers from the JSON in FAKE_GH_STATE and logs each call's arguments to
 FAKE_GH_LOG (one line per call):
 
     {"default_branch": "main" | null, "merged": {"<branch>": [{"number": 1, "headRefOid": "<sha>"}]},
-     "fail": false}
+     "checks": {"exit": 0, "stdout": "", "stderr": ""}, "fail": false}
 
 `fail: true` makes every call exit 1, like gh without auth or network.
 """
@@ -28,6 +28,11 @@ def main(argv):
             return 1
         print(json.dumps({"defaultBranchRef": {"name": state["default_branch"]}}))
         return 0
+    if argv[:2] == ["pr", "checks"]:
+        checks = state.get("checks", {})
+        print(checks.get("stdout", ""), end="")
+        print(checks.get("stderr", ""), end="", file=sys.stderr)
+        return checks.get("exit", 0)
     if argv[:2] == ["pr", "list"] and "--head" in argv:
         head = argv[argv.index("--head") + 1]
         print(json.dumps(state.get("merged", {}).get(head, [])))
