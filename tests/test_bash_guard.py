@@ -173,7 +173,9 @@ class ForceGuardTest(unittest.TestCase):
         for cmd in ("git push --force-with-lease origin feat/x",
                     "git push --force-with-lease --force-if-includes origin feat/x",
                     "git push --force-with-lease=feat/x:abc123 origin feat/x",
-                    "git push -o ci.skip origin feat/x", "git push origin ^feat/old feat/x",
+                    "git push -o ci.skip origin feat/x", "git push -oci.skip origin feat/x",
+                    "git push -uofoo origin feat/x", "git push --push-option=ff origin feat/x",
+                    "git push origin ^feat/old feat/x",
                     'echo "git push --force"', "git fetch -f origin"):
             self.assertEqual(run_hook(cmd, self.repo), (0, ""), cmd)
 
@@ -216,6 +218,13 @@ class MergeGuardTest(unittest.TestCase):
             self.assertIn("MERGE BLOCKED", err)
             self.assertIn("build", err)
         self.assertIn("pr checks 12", self.calls())
+
+    def test_global_repo_option_before_the_command_is_followed(self):
+        self.checks(exit=1, stdout="build\tfail\n")
+        self.assertEqual(self.hook("gh -R o/r pr merge 7 --squash")[0], 2)
+        self.assertEqual(self.hook("gh pr -R o/r merge 7")[0], 2)
+        self.assertEqual(self.hook("gh --repo o/r pr merge --squash 7", tool="PowerShell")[0], 2)
+        self.assertIn("pr checks 7 -R o/r", self.calls())
 
     def test_merge_over_green_checks_is_allowed(self):
         self.checks(exit=0, stdout="build\tpass\t1m\n")

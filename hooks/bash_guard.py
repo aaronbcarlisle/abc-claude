@@ -432,7 +432,8 @@ def push_forced(args):
         if a in PUSH_OPT_WITH_ARG or is_redirect(a):
             k += 2
             continue
-        if a == "--force" or (a[:1] == "-" and a[:2] != "--" and "f" in a[1:]):
+        # In a short cluster, `-o` takes the rest of the word as its value (`-oci.skip`).
+        if a == "--force" or (a[:1] == "-" and a[:2] != "--" and "f" in a[1:].split("o", 1)[0]):
             return True
         if not a.startswith("-"):
             positional.append(a)
@@ -443,10 +444,12 @@ def push_forced(args):
 def merge_target(toks):
     """(PR selector, repo or None) when `toks` merges a PR without `--auto`, else None.
     Covers `gh pr merge` and the REST `pulls/N/merge` and `merge-async` endpoints."""
-    if os.path.basename(toks[0]).lower() not in ("gh", "gh.exe") or len(toks) < 3:
+    if os.path.basename(toks[0]).lower() not in ("gh", "gh.exe"):
         return None
-    if [t.lower() for t in toks[1:3]] == ["pr", "merge"]:
-        args, selector, repo, k = toks[3:], "", None, 0
+    group, rest = gh_word(toks[1:])  # `-R o/r` may come before or between the words
+    action, args = gh_word(rest) if group == "pr" else ("", rest)
+    if group == "pr" and action == "merge":
+        selector, repo, k = "", None, 0
         if "--auto" in args:
             return None  # `--auto` only arms auto-merge; GitHub waits for required checks
         while k < len(args):
@@ -459,8 +462,9 @@ def merge_target(toks):
                 selector = args[k]
             k += 1
         return selector, repo
-    if toks[1].lower() == "api":
-        method, has_fields, endpoint, k = None, False, None, 2
+    if group == "api":
+        toks = [None] + rest  # the endpoint is the first word after `api`
+        method, has_fields, endpoint, k = None, False, None, 1
         while k < len(toks):
             t = toks[k]
             if t in ("-X", "--method") and k + 1 < len(toks):
@@ -493,7 +497,8 @@ def red_checks(cwd, selector, repo):
     if not exe:
         return None
     cmd = [exe, "pr", "checks"] + ([selector] if selector else []) + (["-R", repo] if repo else [])
-    r = subprocess.run(cmd, cwd=cwd, capture_output=True, encoding="utf-8", errors="replace", timeout=60)
+    # Under the hook's 15 s budget, so a stalled gh fails open instead of killing the hook.
+    r = subprocess.run(cmd, cwd=cwd, capture_output=True, encoding="utf-8", errors="replace", timeout=10)
     out = (r.stdout + r.stderr).strip()
     if r.returncode == 0 or "no checks reported" in out:
         return None

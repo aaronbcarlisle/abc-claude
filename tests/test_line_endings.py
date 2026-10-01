@@ -68,6 +68,15 @@ class LineEndingsTest(unittest.TestCase):
         self.put("c.txt", b"one\r\ntwo\r\n")
         self.assertEqual(run_hook(path, tool="Edit"), (0, ""))
 
+    def test_write_of_an_all_crlf_tracked_file_is_flagged(self):
+        # The stale-checkout exemption is for Edit, which keeps endings; Write chose them.
+        path = self.put("c2.txt", b"one\ntwo\n")
+        git("add", "c2.txt", cwd=self.repo)
+        self.put("c2.txt", b"one\r\ntwo\r\n")
+        code, err = run_hook(path, tool="Write")
+        self.assertEqual(code, 2)
+        self.assertIn("CRLF", err)
+
     def test_lf_files_and_crlf_attribute_files_pass(self):
         self.assertEqual(run_hook(self.put("d.md", b"one\ntwo\n")), (0, ""))
         self.assertEqual(run_hook(self.put("e.bat", b"one\r\ntwo\r\n")), (0, ""))
