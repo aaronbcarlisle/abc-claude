@@ -5,7 +5,7 @@
 # The repo is private, so download it signed in, inspect it, then run it:
 #   gh api repos/aaronbcarlisle/abc-claude/contents/install.sh -H "Accept: application/vnd.github.raw" > install.sh
 #   less install.sh   # review before running
-#   sh install.sh [--yes] [--prune]
+#   sh install.sh [--yes] [--prune] [--force]
 # Or run it from a clone: gh repo clone aaronbcarlisle/abc-claude <dir>; sh <dir>/install.sh
 #
 # Idempotent and safe to re-run. It will:
@@ -13,6 +13,10 @@
 #   2. Find the source: the checkout it runs from, or ABC_CLAUDE_REPO.
 #   3. Make ~/.claude (or $CLAUDE_CONFIG_DIR) a working tree of the repo,
 #      backing up any file it replaces to <path>.bak.<yyyyMMddHHmmss>.
+#      An existing checkout with local changes is left as-is unless --force:
+#      then modified files are backed up, local commits are kept on a branch
+#      backup/<yyyyMMddHHmmss>, and master is reset to origin/master.
+#      Untracked files are never touched, unless the repo now tracks them.
 #   4. Create rules/local.md and set this repo's git identity.
 #   5. Report managed settings and check that python resolves.
 #   6. Install the marketplaces and plugins listed in settings.json.
@@ -28,6 +32,7 @@ NL='
 '
 YES=0
 PRUNE=0
+FORCE=0
 WARNINGS=0
 BACKUPS=""
 PY=""
@@ -61,12 +66,22 @@ ask() {
 }
 
 # --- arguments --------------------------------------------------------------
-usage() { printf 'Usage: sh install.sh [--yes] [--prune]\n'; }
+usage() { printf 'Usage: sh install.sh [--yes] [--prune] [--force]\n'; }
+help_text() {
+    printf '  --yes    Non-interactive: take every default.\n'
+    printf '  --prune  Ask whether to uninstall plugins not in settings.json.\n'
+    printf '  --force  Update an existing checkout even with local changes: back up\n'
+    printf '           modified files to <path>.bak.<stamp>, keep local commits on a\n'
+    printf '           backup/<stamp> branch, then reset master to origin/master.\n'
+    printf '           Untracked files stay as they are, unless the repo now tracks\n'
+    printf '           them with other content: those are backed up too.\n'
+}
 for arg in "$@"; do
     case "$arg" in
         --yes|-y) YES=1 ;;
         --prune) PRUNE=1 ;;
-        -h|--help) usage; exit 0 ;;
+        --force) FORCE=1 ;;
+        -h|--help) usage; help_text; exit 0 ;;
         *) usage >&2; die "Unknown option: $arg" ;;
     esac
 done
@@ -262,6 +277,10 @@ update_existing() {
     info "$TARGET is an abc-claude checkout - updating it."
     info "Close running Claude Code sessions first: they can hold files open."
     restore_missing
+    if [ "$FORCE" = 1 ]; then
+        force_update
+        return 0
+    fi
     if [ -n "$(git -C "$TARGET" status --porcelain --untracked-files=no)" ]; then
         warn "Tracked files in $TARGET have local changes - skipping the pull. Commit or discard them, then re-run."
         return 0
@@ -269,6 +288,71 @@ update_existing() {
     if check_remote "$origin" warn; then
         git -C "$TARGET" pull --ff-only || warn "Could not fast-forward $TARGET; leaving it as-is."
     fi
+}
+
+# --- bootstrap: force -------------------------------------------------------
+# force_backup FILE - copy FILE (relative to the target) to FILE.bak.<STAMP>.
+force_backup() {
+    cp -p "$TARGET/$1" "$TARGET/$1.bak.$STAMP" || die "Could not back up $1. $TARGET was not reset."
+    BACKUPS="$BACKUPS$1.bak.$STAMP$NL"
+}
+
+# backup_local_changes - back up tracked files with staged or unstaged changes,
+# and untracked files that origin/master tracks with other content.
+backup_local_changes() {
+    staged=$(git -C "$TARGET" -c core.quotepath=off diff --cached --name-only) || die "git diff failed in $TARGET. It was not reset."
+    unstaged=$(git -C "$TARGET" -c core.quotepath=off diff --name-only) || die "git diff failed in $TARGET. It was not reset."
+    tracked=$(git -C "$TARGET" -c core.quotepath=off ls-files) || die "git ls-files failed in $TARGET. It was not reset."
+    upstream=$(git -C "$TARGET" -c core.quotepath=off ls-tree -r --name-only refs/remotes/origin/master) \
+        || die "git ls-tree of origin/master failed in $TARGET. It was not reset."
+    changed=$(printf '%s\n%s\n' "$staged" "$unstaged" | sort -u)
+    set -f; old_ifs=$IFS; IFS=$NL
+    for f in $changed; do
+        if [ -f "$TARGET/$f" ]; then force_backup "$f"; fi
+    done
+    for f in $upstream; do
+        if [ ! -f "$TARGET/$f" ] || printf '%s\n%s\n' "$tracked" "$changed" | grep -Fqx -- "$f"; then continue; fi
+        local_id=$(git -C "$TARGET" hash-object -- "$f") || local_id=""
+        repo_id=$(git -C "$TARGET" rev-parse -q --verify "refs/remotes/origin/master:$f") || repo_id=""
+        if [ "$local_id" != "$repo_id" ]; then force_backup "$f"; fi
+    done
+    IFS=$old_ifs; set +f
+}
+
+# keep_local_commits - put commits that the reset would drop on backup branches:
+# master's commits not on origin/master, and a detached HEAD's loose commits.
+keep_local_commits() {
+    ahead=$(git -C "$TARGET" rev-list --count refs/remotes/origin/master..refs/heads/master 2>/dev/null) || ahead=0
+    if [ "${ahead:-0}" -gt 0 ]; then
+        git -C "$TARGET" branch -q "backup/$STAMP" refs/heads/master || die "Could not create branch backup/$STAMP. $TARGET was not reset."
+        info "Kept $ahead local commit(s) of master on branch backup/$STAMP."
+    fi
+    if git -C "$TARGET" symbolic-ref -q HEAD >/dev/null 2>&1; then return 0; fi
+    loose=$(git -C "$TARGET" rev-list --count HEAD --not --branches --remotes 2>/dev/null) || loose=0
+    if [ "${loose:-0}" -gt 0 ]; then
+        git -C "$TARGET" branch -q "backup/$STAMP-head" HEAD || die "Could not create branch backup/$STAMP-head. $TARGET was not reset."
+        info "Kept $loose commit(s) of the detached HEAD on branch backup/$STAMP-head."
+    fi
+}
+
+# force_update - back up local changes and commits, then reset master to
+# origin/master. Untracked files the repo doesn't track are never touched.
+force_update() {
+    if ! check_remote "$origin" warn; then
+        warn "--force needs the remote: leaving $TARGET as-is."
+        return 0
+    fi
+    if ! git -C "$TARGET" fetch -q origin "+refs/heads/master:refs/remotes/origin/master"; then
+        warn "git fetch failed in $TARGET; leaving it as-is."
+        return 0
+    fi
+    backup_local_changes
+    keep_local_commits
+    if ! git -C "$TARGET" checkout -q -f -B master refs/remotes/origin/master || ! git -C "$TARGET" reset -q --hard refs/remotes/origin/master; then
+        die "git checkout failed partway (a running Claude Code session may hold a file open). Close Claude Code and re-run with --force."
+    fi
+    git -C "$TARGET" branch -q -u origin/master master || warn "git branch -u origin/master failed in $TARGET."
+    info "Reset $TARGET to origin/master."
 }
 
 warn_uncommitted_source() {
@@ -302,6 +386,7 @@ restart_adopt() {
 bootstrap() {
     if in_place; then
         info "Running from the checkout at $TARGET - using it in place."
+        if [ "$FORCE" = 1 ]; then info "--force doesn't apply to an in-place run: leaving $TARGET as-is."; fi
         return 0
     fi
     if [ -e "$TARGET/.git" ]; then

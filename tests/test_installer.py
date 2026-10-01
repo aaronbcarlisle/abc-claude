@@ -95,6 +95,176 @@ class InstallerScenarios:
         self.assertEqual(self.target_git("rev-parse", "HEAD"), head)
         self.assertEqual((self.sb.target / "CLAUDE.md").read_bytes(), b"# My local edit\n")
 
+    def test_rerun_with_a_local_commit_leaves_it_without_force(self):
+        self.assertOk(self.install("--yes"))
+        (self.sb.target / "CLAUDE.md").write_bytes(b"# Committed local edit\n")
+        h.git("-C", str(self.sb.target), *h.FIXTURE_IDENT, "commit", "-q", "-am", "local work")
+        head = self.target_git("rev-parse", "HEAD")
+        self.sb.push_change({"rules/dev-tooling.md": "# Upstream change\n"})
+        result = self.install("--yes")
+        self.assertOk(result)
+        self.assertIn("Could not fast-forward", result.output)
+        self.assertEqual(self.target_git("rev-parse", "HEAD"), head)
+        self.assertEqual(h.backups(self.sb.target), [])
+        self.assertEqual(self.target_git("for-each-ref", "refs/heads/backup"), "")
+
+    # --- --force ------------------------------------------------------------
+    def remote_head(self):
+        return h.git("-C", str(self.sb.remote), "rev-parse", "refs/heads/master").strip()
+
+    def backup_branches(self):
+        return self.target_git("for-each-ref", "--format=%(refname:short)", "refs/heads/backup").split()
+
+    def test_help_mentions_force(self):
+        result = self.install("--help")
+        self.assertOk(result)
+        self.assertIn(h.translate_flag("--force", self.INTERP), result.output)
+
+    def test_unknown_flag_with_force_exits_1(self):
+        result = self.install("--force", "--bogus")
+        self.assertEqual(result.returncode, 1, result)
+        self.assertFalse(self.sb.target.exists())
+
+    def test_force_on_a_fresh_target_clones(self):
+        result = self.install("--yes", "--force")
+        self.assertOk(result)
+        self.assertIn("Cloning into", result.output)
+        self.assertEqual(self.target_git("rev-parse", "HEAD"), self.remote_head())
+
+    def test_force_on_a_clean_checkout_updates_without_backups(self):
+        self.assertOk(self.install("--yes"))
+        self.sb.push_change({"CLAUDE.md": "# Updated rules\n"})
+        result = self.install("--yes", "--force")
+        self.assertOk(result)
+        self.assertEqual((self.sb.target / "CLAUDE.md").read_bytes(), b"# Updated rules\n")
+        self.assertEqual(self.target_git("rev-parse", "HEAD"), self.remote_head())
+        self.assertEqual(h.backups(self.sb.target), [])
+        self.assertEqual(self.backup_branches(), [])
+        self.assertNotIn("Backed up files", result.output)
+
+    def test_force_backs_up_local_edits_and_resets(self):
+        self.assertOk(self.install("--yes"))
+        t = self.sb.target
+        local_md = (t / "rules" / "local.md").read_bytes()
+        (t / "CLAUDE.md").write_bytes(b"# My local edit\n")
+        (t / "rules" / "dev-tooling.md").write_bytes(b"# Staged local edit\n")
+        h.git("-C", str(t), "add", "rules/dev-tooling.md")
+        (t / "rules" / "mine.md").write_bytes(b"# Local-only rule\n")
+        (t / "history.jsonl").write_bytes(b'{"junk": 1}\n')
+        self.sb.push_change({"settings.json": json.dumps({"model": "haiku"}) + "\n"})
+        result = self.install("--yes", "--force")
+        self.assertOk(result)
+        baks = h.backups(t)
+        self.assertEqual(len(baks), 2, baks)
+        self.assertTrue(re.fullmatch(r"CLAUDE\.md\.bak\.\d{14}", baks[0]), baks)
+        self.assertTrue(re.fullmatch(r"rules/dev-tooling\.md\.bak\.\d{14}", baks[1]), baks)
+        self.assertEqual((t / baks[0]).read_bytes(), b"# My local edit\n")
+        self.assertEqual((t / baks[1]).read_bytes(), b"# Staged local edit\n")
+        self.assertIn("Backed up files that differed from the repo", result.output)
+        for bak in baks:
+            self.assertIn("    " + bak, result.output)
+        self.assertEqual((t / "CLAUDE.md").read_bytes(), b"# Fixture global rules\n")
+        self.assertEqual((t / "rules" / "dev-tooling.md").read_bytes(), b"# Fixture tooling rules\n")
+        self.assertEqual(json.loads((t / "settings.json").read_text(encoding="utf-8")), {"model": "haiku"})
+        self.assertEqual(self.target_git("rev-parse", "HEAD"), self.remote_head())
+        self.assertEqual(self.target_git("rev-parse", "--abbrev-ref", "HEAD"), "master")
+        self.assertEqual(self.target_git("rev-parse", "--abbrev-ref", "@{u}"), "origin/master")
+        self.assertEqual(self.target_git("status", "--porcelain", "--untracked-files=no"), "")
+        # Untracked and ignored files are never touched.
+        self.assertEqual((t / "rules" / "local.md").read_bytes(), local_md)
+        self.assertEqual((t / "rules" / "mine.md").read_bytes(), b"# Local-only rule\n")
+        self.assertEqual((t / "history.jsonl").read_bytes(), b'{"junk": 1}\n')
+        self.assertEqual(self.backup_branches(), [])
+
+    def test_force_keeps_local_commits_on_a_backup_branch(self):
+        self.assertOk(self.install("--yes"))
+        t = self.sb.target
+        (t / "CLAUDE.md").write_bytes(b"# Committed local edit\n")
+        h.git("-C", str(t), *h.FIXTURE_IDENT, "commit", "-q", "-am", "local work")
+        local = self.target_git("rev-parse", "HEAD")
+        self.sb.push_change({"rules/dev-tooling.md": "# Upstream change\n"})
+        result = self.install("--yes", "--force")
+        self.assertOk(result)
+        branches = self.backup_branches()
+        self.assertEqual(len(branches), 1, branches)
+        self.assertTrue(re.fullmatch(r"backup/\d{14}", branches[0]), branches)
+        self.assertEqual(self.target_git("rev-parse", branches[0]), local)
+        self.assertIn(branches[0], result.output)
+        self.assertEqual(self.target_git("rev-parse", "refs/heads/master"), self.remote_head())
+        self.assertEqual((t / "CLAUDE.md").read_bytes(), b"# Fixture global rules\n")
+        self.assertEqual((t / "rules" / "dev-tooling.md").read_bytes(), b"# Upstream change\n")
+        self.assertEqual(h.backups(t), [])
+
+    def test_force_keeps_commits_of_a_detached_head(self):
+        self.assertOk(self.install("--yes"))
+        t = self.sb.target
+        h.git("-C", str(t), "checkout", "-q", "--detach")
+        (t / "CLAUDE.md").write_bytes(b"# Detached work\n")
+        h.git("-C", str(t), *h.FIXTURE_IDENT, "commit", "-q", "-am", "detached work")
+        detached = self.target_git("rev-parse", "HEAD")
+        result = self.install("--yes", "--force")
+        self.assertOk(result)
+        branches = self.backup_branches()
+        self.assertEqual(len(branches), 1, branches)
+        self.assertEqual(self.target_git("rev-parse", branches[0]), detached)
+        self.assertEqual(self.target_git("rev-parse", "--abbrev-ref", "HEAD"), "master")
+        self.assertEqual(self.target_git("rev-parse", "HEAD"), self.remote_head())
+
+    def test_force_backs_up_an_untracked_file_the_repo_now_tracks(self):
+        self.assertOk(self.install("--yes"))
+        t = self.sb.target
+        (t / "rules" / "new-rule.md").write_bytes(b"# My own version\n")
+        (t / "rules" / "same.md").write_bytes(b"# Same\n")
+        self.sb.push_change({"rules/new-rule.md": "# Upstream version\n", "rules/same.md": "# Same\n"})
+        result = self.install("--yes", "--force")
+        self.assertOk(result)
+        baks = h.backups(t)
+        self.assertEqual(len(baks), 1, baks)
+        self.assertTrue(re.fullmatch(r"rules/new-rule\.md\.bak\.\d{14}", baks[0]), baks)
+        self.assertEqual((t / baks[0]).read_bytes(), b"# My own version\n")
+        self.assertEqual((t / "rules" / "new-rule.md").read_bytes(), b"# Upstream version\n")
+        self.assertEqual(self.target_git("rev-parse", "HEAD"), self.remote_head())
+
+    def test_force_with_unreachable_remote_changes_nothing(self):
+        self.assertOk(self.install("--yes"))
+        t = self.sb.target
+        (t / "CLAUDE.md").write_bytes(b"# My local edit\n")
+        head = self.target_git("rev-parse", "HEAD")
+        self.sb.remote.rename(self.sb.root / "remote-away.git")
+        before = h.snapshot(t)
+        result = self.install("--yes", "--force")
+        self.assertOk(result)
+        self.assertIn("Cannot reach", result.output)
+        self.assertEqual(self.target_git("rev-parse", "HEAD"), head)
+        self.assertEqual(h.backups(t), [])
+        self.assertEqual((t / "CLAUDE.md").read_bytes(), b"# My local edit\n")
+        worktree = lambda snap: {k: v for k, v in snap.items() if not k.startswith(".git/")}
+        self.assertEqual(worktree(h.snapshot(t)), worktree(before))
+
+    def test_force_with_a_foreign_origin_still_exits_1(self):
+        self.sb.target.mkdir()
+        h.git("init", "-q", "-b", "master", cwd=self.sb.target)
+        h.git("remote", "add", "origin", "https://example.invalid/someone/other.git", cwd=self.sb.target)
+        (self.sb.target / "settings.json").write_bytes(b'{"mine": true}\n')
+        before = h.snapshot(self.sb.target)
+        result = self.install("--yes", "--force")
+        self.assertEqual(result.returncode, 1, result)
+        self.assertIn("is a git repo with a different origin", result.output)
+        self.assertEqual(h.snapshot(self.sb.target), before)
+
+    def test_force_in_place_notes_it_does_not_apply(self):
+        self.assertOk(self.install("--yes"))
+        t = self.sb.target
+        (t / "CLAUDE.md").write_bytes(b"# My local edit\n")
+        head = self.target_git("rev-parse", "HEAD")
+        result = self.install("--yes", "--force", script_dir=t)
+        self.assertOk(result)
+        self.assertIn("using it in place", result.output)
+        self.assertIn(h.translate_flag("--force", self.INTERP) + " doesn't apply", result.output)
+        self.assertEqual((t / "CLAUDE.md").read_bytes(), b"# My local edit\n")
+        self.assertEqual(self.target_git("rev-parse", "HEAD"), head)
+        self.assertEqual(h.backups(t), [])
+
     def test_missing_tracked_files_are_restored(self):
         self.assertOk(self.install("--yes"))
         (self.sb.target / "CLAUDE.md").unlink()

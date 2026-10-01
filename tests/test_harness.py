@@ -39,6 +39,7 @@ class HarnessTest(unittest.TestCase):
         self.assertEqual(h.translate_flag("--yes", "sh"), "--yes")
         self.assertEqual(h.translate_flag("--yes", "pwsh"), "-Yes")
         self.assertEqual(h.translate_flag("--prune", "powershell"), "-Prune")
+        self.assertEqual(h.translate_flag("--force", "pwsh"), "-Force")
 
     def fake_call(self, *args):
         """Run the fake claude through the stub a shell would find."""

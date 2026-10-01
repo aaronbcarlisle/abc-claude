@@ -45,7 +45,7 @@ On Windows, run `powershell -ExecutionPolicy Bypass -File <dir>\install.ps1` ins
 2. **Source:** the checkout it runs from, if that's an abc-claude checkout; otherwise `ABC_CLAUDE_REPO`.
 3. **Bootstrap** `~/.claude` (or `CLAUDE_CONFIG_DIR`), depending on what's there:
    - **Nothing:** clones the repo.
-   - **An abc-claude checkout:** restores missing tracked files, then runs `git pull --ff-only` if no tracked file is modified.
+   - **An abc-claude checkout:** restores missing tracked files, then runs `git pull --ff-only` if no tracked file is modified. With local changes, or local commits it can't fast-forward past, it leaves the checkout as-is, unless you pass `--force` (`-Force`).
    - **A git repo with another origin:** exits 1 and changes nothing.
    - **A folder that isn't a git repo:** adopts it in place. Files that differ from the repo are backed up, then the tracked files are written. Files that exist only locally are listed, so you can commit or delete them.
 4. **Machine-local:** creates the untracked `rules/local.md` from `templates/local.md`, after asking for a machine label and whether admin rights or Developer Mode are available. It also sets this repo's git `user.name` and `user.email`.
@@ -61,6 +61,7 @@ Re-running is safe: on a clean checkout it changes nothing.
 |---|---|---|
 | `--yes` | `-Yes` | Non-interactive: take every default. |
 | `--prune` | `-Prune` | For each installed plugin that isn't in `enabledPlugins`, ask whether to uninstall it. Under `--yes` it only reports. |
+| `--force` | `-Force` | Make an existing abc-claude checkout match the repo, even with local changes. Each modified tracked file is first backed up to `<path>.bak.<yyyyMMddHHmmss>` and listed in the summary. Commits on `master` that aren't on `origin/master` are kept on a branch `backup/<yyyyMMddHHmmss>`. Then `master` is fetched and hard-reset to `origin/master`. Untracked files, such as `rules/local.md`, credentials and history, are never touched, unless the repo now tracks one with other content: that one is backed up too. If the remote can't be reached, nothing changes. It doesn't apply to a run from the target checkout itself, and a git repo with another origin still exits 1. Off by default. |
 | `--help` | `-Help` | Print usage. |
 
 | Variable | Default | Meaning |
