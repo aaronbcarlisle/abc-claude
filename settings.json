@@ -22,6 +22,17 @@
     "anthropic-skills:pdf": "off"
   },
   "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python \"$HOME/.claude/hooks/session_start.py\"",
+            "timeout": 15
+          }
+        ]
+      }
+    ],
     "PreToolUse": [
       {
         "matcher": "Bash|PowerShell",
@@ -41,6 +52,16 @@
             "type": "command",
             "command": "python \"$HOME/.claude/hooks/context_budget.py\"",
             "timeout": 10
+          }
+        ]
+      },
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python \"$HOME/.claude/hooks/line_endings.py\"",
+            "timeout": 15
           }
         ]
       },
