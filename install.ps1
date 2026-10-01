@@ -269,11 +269,11 @@ function Update-Existing($Origin) {
     }
     $dirty =@(Invoke-Quiet 'git' @('-C', $T, 'status', '--porcelain', '--untracked-files=no') | Where-Object { $_ })
     if ($dirty.Count -gt 0) {
-        Write-Warn "Tracked files in $T have local changes - skipping the pull. Commit or discard them, then re-run."
+        Write-Warn "Tracked files in $T have local changes - skipping the pull. Commit or discard them, or re-run with -Force to back them up and replace them."
         return
     }
     if (Test-Remote $Origin) {
-        if (-not (Invoke-Git @('-C', $T, 'pull', '--ff-only'))) { Write-Warn "Could not fast-forward $T; leaving it as-is." }
+        if (-not (Invoke-Git @('-C', $T, 'pull', '--ff-only'))) { Write-Warn "Could not fast-forward $T; leaving it as-is (re-run with -Force to replace it)." }
     }
 }
 

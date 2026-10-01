@@ -282,11 +282,11 @@ update_existing() {
         return 0
     fi
     if [ -n "$(git -C "$TARGET" status --porcelain --untracked-files=no)" ]; then
-        warn "Tracked files in $TARGET have local changes - skipping the pull. Commit or discard them, then re-run."
+        warn "Tracked files in $TARGET have local changes - skipping the pull. Commit or discard them, or re-run with --force to back them up and replace them."
         return 0
     fi
     if check_remote "$origin" warn; then
-        git -C "$TARGET" pull --ff-only || warn "Could not fast-forward $TARGET; leaving it as-is."
+        git -C "$TARGET" pull --ff-only || warn "Could not fast-forward $TARGET; leaving it as-is (re-run with --force to replace it)."
     fi
 }
 
