@@ -4,7 +4,7 @@
 # The repo is private, so download it signed in, inspect it, then run it:
 #   gh api repos/aaronbcarlisle/abc-claude/contents/install.ps1 -H "Accept: application/vnd.github.raw" > install.ps1
 #   notepad install.ps1   # review before running
-#   powershell -ExecutionPolicy Bypass -File install.ps1 [-Yes] [-Prune]
+#   powershell -ExecutionPolicy Bypass -File install.ps1 [-Yes] [-Prune] [-Force]
 # Or run it from a clone: gh repo clone aaronbcarlisle/abc-claude <dir>, then
 #   powershell -ExecutionPolicy Bypass -File <dir>\install.ps1
 #
@@ -13,6 +13,10 @@
 #   2. Find the source: the checkout it runs from, or ABC_CLAUDE_REPO.
 #   3. Make ~/.claude (or $env:CLAUDE_CONFIG_DIR) a working tree of the repo,
 #      backing up any file it replaces to <path>.bak.<yyyyMMddHHmmss>.
+#      An existing checkout with local changes is left as-is unless -Force:
+#      then modified files are backed up, local commits are kept on a branch
+#      backup/<yyyyMMddHHmmss>, and master is reset to origin/master.
+#      Untracked files are never touched, unless the repo now tracks them.
 #   4. Create rules/local.md and set this repo's git identity.
 #   5. Report managed settings and check that python resolves from Git Bash.
 #   6. Install the marketplaces and plugins listed in settings.json.
@@ -20,7 +24,7 @@
 
 #Requires -Version 5
 [CmdletBinding()]
-param([switch]$Yes, [switch]$Prune, [switch]$Help)
+param([switch]$Yes, [switch]$Prune, [switch]$Force, [switch]$Help)
 $ErrorActionPreference = 'Stop'
 
 $DefaultRepo = 'https://github.com/aaronbcarlisle/abc-claude.git'
@@ -83,7 +87,14 @@ function Ask($Prompt, $Default) {
 }
 
 if ($Help) {
-    Write-Host 'Usage: powershell -ExecutionPolicy Bypass -File install.ps1 [-Yes] [-Prune]'
+    Write-Host 'Usage: powershell -ExecutionPolicy Bypass -File install.ps1 [-Yes] [-Prune] [-Force]'
+    Write-Host '  -Yes    Non-interactive: take every default.'
+    Write-Host '  -Prune  Ask whether to uninstall plugins not in settings.json.'
+    Write-Host '  -Force  Update an existing checkout even with local changes: back up'
+    Write-Host '          modified files to <path>.bak.<stamp>, keep local commits on a'
+    Write-Host '          backup/<stamp> branch, then reset master to origin/master.'
+    Write-Host '          Untracked files stay as they are, unless the repo now tracks'
+    Write-Host '          them with other content: those are backed up too.'
     exit 0
 }
 
@@ -251,15 +262,93 @@ function Update-Existing($Origin) {
     $T = $script:Target
     Write-Info "$T is an abc-claude checkout - updating it."
     Write-Info 'Close running Claude Code sessions first: they can hold files open.'
+    # -Force restores missing files with its reset, and must change nothing
+    # when the remote is unreachable, so it skips Restore-Missing.
+    if ($Force) {
+        Invoke-ForceUpdate $Origin
+        return
+    }
     Restore-Missing
-    $dirty = @(Invoke-Quiet 'git' @('-C', $T, 'status', '--porcelain', '--untracked-files=no') | Where-Object { $_ })
+    $dirty =@(Invoke-Quiet 'git' @('-C', $T, 'status', '--porcelain', '--untracked-files=no') | Where-Object { $_ })
     if ($dirty.Count -gt 0) {
-        Write-Warn "Tracked files in $T have local changes - skipping the pull. Commit or discard them, then re-run."
+        Write-Warn "Tracked files in $T have local changes - skipping the pull. Commit or discard them, or re-run with -Force to back them up and replace them."
         return
     }
     if (Test-Remote $Origin) {
-        if (-not (Invoke-Git @('-C', $T, 'pull', '--ff-only'))) { Write-Warn "Could not fast-forward $T; leaving it as-is." }
+        if (-not (Invoke-Git @('-C', $T, 'pull', '--ff-only'))) { Write-Warn "Could not fast-forward $T; leaving it as-is (re-run with -Force to replace it)." }
     }
+}
+
+# --- bootstrap: force -------------------------------------------------------
+# Copy $f (relative to the target) to $f.bak.<Stamp>.
+function Backup-ForceFile($f) {
+    $src = Join-Path $script:Target $f
+    try { Copy-Item -LiteralPath $src -Destination "$src.bak.$Stamp" -Force } catch { Fail "Could not back up $f. $($script:Target) was not reset." }
+    $script:Backups += "$f.bak.$Stamp"
+}
+
+# Back up tracked files with staged or unstaged changes, and untracked files
+# that origin/master tracks with other content.
+function Backup-LocalChanges {
+    $T = $script:Target
+    $staged = @(Invoke-Quiet 'git' @('-C', $T, '-c', 'core.quotepath=off', 'diff', '--cached', '--name-only') | Where-Object { $_ })
+    if ($script:NativeExit -ne 0) { Fail "git diff failed in $T. It was not reset." }
+    $unstaged = @(Invoke-Quiet 'git' @('-C', $T, '-c', 'core.quotepath=off', 'diff', '--name-only') | Where-Object { $_ })
+    if ($script:NativeExit -ne 0) { Fail "git diff failed in $T. It was not reset." }
+    $tracked = @(Invoke-Quiet 'git' @('-C', $T, '-c', 'core.quotepath=off', 'ls-files') | Where-Object { $_ })
+    if ($script:NativeExit -ne 0) { Fail "git ls-files failed in $T. It was not reset." }
+    $upstream = @(Invoke-Quiet 'git' @('-C', $T, '-c', 'core.quotepath=off', 'ls-tree', '-r', '--name-only', 'refs/remotes/origin/master') | Where-Object { $_ })
+    if ($script:NativeExit -ne 0) { Fail "git ls-tree of origin/master failed in $T. It was not reset." }
+    $changed = @($staged + $unstaged | Select-Object -Unique | Sort-Object)
+    foreach ($f in $changed) {
+        if (Test-Path -LiteralPath (Join-Path $T $f) -PathType Leaf) { Backup-ForceFile $f }
+    }
+    foreach ($f in $upstream) {
+        if (-not (Test-Path -LiteralPath (Join-Path $T $f) -PathType Leaf) -or ($tracked -ccontains $f) -or ($changed -ccontains $f)) { continue }
+        $localId = Get-GitLine @('-C', $T, 'hash-object', '--', $f)
+        $repoId = Get-GitLine @('-C', $T, 'rev-parse', '-q', '--verify', "refs/remotes/origin/master:$f")
+        if ($localId -ne $repoId) { Backup-ForceFile $f }
+    }
+}
+
+# Put commits that the reset would drop on backup branches: master's commits
+# not on origin/master, and a detached HEAD's loose commits.
+function Save-LocalCommits {
+    $T = $script:Target
+    $ahead = Get-GitLine @('-C', $T, 'rev-list', '--count', 'refs/remotes/origin/master..refs/heads/master')
+    if ($ahead -and [int]$ahead -gt 0) {
+        if (-not (Invoke-Git @('-C', $T, 'branch', '-q', "backup/$Stamp", 'refs/heads/master'))) { Fail "Could not create branch backup/$Stamp. $T was not reset." }
+        Write-Info "Kept $ahead local commit(s) of master on branch backup/$Stamp."
+    }
+    Invoke-Quiet 'git' @('-C', $T, 'symbolic-ref', '-q', 'HEAD') | Out-Null
+    if ($script:NativeExit -eq 0) { return }
+    $loose = Get-GitLine @('-C', $T, 'rev-list', '--count', 'HEAD', '--not', '--branches', '--remotes')
+    if ($loose -and [int]$loose -gt 0) {
+        if (-not (Invoke-Git @('-C', $T, 'branch', '-q', "backup/$($Stamp)-head", 'HEAD'))) { Fail "Could not create branch backup/$($Stamp)-head. $T was not reset." }
+        Write-Info "Kept $loose commit(s) of the detached HEAD on branch backup/$($Stamp)-head."
+    }
+}
+
+# Back up local changes and commits, then reset master to origin/master.
+# Untracked files the repo doesn't track are never touched.
+function Invoke-ForceUpdate($Origin) {
+    $T = $script:Target
+    if (-not (Test-Remote $Origin)) {
+        Write-Warn "-Force needs the remote: leaving $T as-is."
+        return
+    }
+    if (-not (Invoke-Git @('-C', $T, 'fetch', '-q', 'origin', '+refs/heads/master:refs/remotes/origin/master'))) {
+        Write-Warn "git fetch failed in $T; leaving it as-is."
+        return
+    }
+    Backup-LocalChanges
+    Save-LocalCommits
+    if ((-not (Invoke-Git @('-C', $T, 'checkout', '-q', '-f', '-B', 'master', 'refs/remotes/origin/master'))) -or
+        (-not (Invoke-Git @('-C', $T, 'reset', '-q', '--hard', 'refs/remotes/origin/master')))) {
+        Fail 'git checkout failed partway (a running Claude Code session may hold a file open). Close Claude Code and re-run with -Force.'
+    }
+    if (-not (Invoke-Git @('-C', $T, 'branch', '-q', '-u', 'origin/master', 'master'))) { Write-Warn "git branch -u origin/master failed in $T." }
+    Write-Info "Reset $T to origin/master."
 }
 
 function Warn-UncommittedSource {
@@ -319,6 +408,7 @@ function Invoke-Bootstrap {
     $T = $script:Target
     if (Test-InPlace) {
         Write-Info "Running from the checkout at $T - using it in place."
+        if ($Force) { Write-Info "-Force doesn't apply to an in-place run: leaving $T as-is." }
         return
     }
     if (Test-Path -LiteralPath (Join-Path $T '.git')) {
