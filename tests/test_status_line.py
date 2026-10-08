@@ -84,7 +84,7 @@ class ContextTest(unittest.TestCase):
 
 BRIDGE_LINE = '{"type":"bridge-session","sessionId":"s","bridgeSessionId":"cse_1","lastSequenceNum":1}\n'
 DISCONNECT_LINE = '{"type":"bridge-session","sessionId":"s","bridgeSessionId":"","lastSequenceNum":0}\n'
-OTHER_LINE ='{"type":"assistant","message":{"content":"hi"}}\n'
+OTHER_LINE = '{"type":"assistant","message":{"content":"hi"}}\n'
 
 
 class RemoteTest(unittest.TestCase):
@@ -119,6 +119,18 @@ class RemoteTest(unittest.TestCase):
     def test_ignores_record_outside_tail(self):
         path = self.transcript(BRIDGE_LINE + "x" * sl.REMOTE_TAIL_BYTES + "\n")
         self.assertFalse(sl.remote_connected(path))
+
+    def test_record_beyond_scan_window_but_inside_tail(self):
+        path = self.transcript(BRIDGE_LINE + "x" * (sl.REMOTE_SCAN_BYTES * 2) + "\n")
+        self.assertTrue(sl.remote_connected(path))
+
+    def test_record_starting_at_tail_edge(self):
+        path = self.transcript("x" * 10 + "\n" + BRIDGE_LINE + "y" * (sl.REMOTE_TAIL_BYTES - len(BRIDGE_LINE)))
+        self.assertTrue(sl.remote_connected(path))
+
+    def test_partial_record_mid_append_falls_back(self):
+        path = self.transcript(BRIDGE_LINE + OTHER_LINE + DISCONNECT_LINE[:30])
+        self.assertTrue(sl.remote_connected(path))
 
     def test_missing_or_absent_path(self):
         self.assertFalse(sl.remote_connected(None))

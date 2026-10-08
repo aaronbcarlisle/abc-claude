@@ -70,8 +70,10 @@ LIMIT_CRITICAL = 90   # red
 LIMIT_WINDOWS = (("five_hour", "5h"), ("seven_day", "7d"))
 
 # Remote Control detection: how much of the transcript's end to scan for the
-# record. Between turns it sits within ~16 KB of the end; mid-turn, large tool
-# output can push it back further, so the badge may drop out until the turn ends.
+# record (the small window first, then the full tail). Between turns it sits
+# within ~16 KB of the end; mid-turn, large tool output can push it back
+# further, so the badge may drop out until the turn ends.
+REMOTE_SCAN_BYTES = 65_536
 REMOTE_TAIL_BYTES = 1_048_576
 BRIDGE_RECORD = b'{"type":"bridge-session"'
 
@@ -201,22 +203,35 @@ def remote_connected(transcript_path):
         return False
     try:
         with open(transcript_path, "rb") as f:
-            f.seek(0, os.SEEK_END)
-            f.seek(max(0, f.tell() - REMOTE_TAIL_BYTES))
-            tail = f.read()
+            size = f.seek(0, os.SEEK_END)
+            # Scan a small window first (the record is usually within ~16 KB of
+            # the end), widening to REMOTE_TAIL_BYTES only when it isn't there.
+            for window in (REMOTE_SCAN_BYTES, REMOTE_TAIL_BYTES):
+                # One byte before the window, so a record starting right at its
+                # edge still follows a newline; a cut-off partial line never does.
+                pos = max(0, size - window - 1)
+                f.seek(pos)
+                tail = (b"\n" if pos == 0 else b"") + f.read()
+                connected = last_bridge_state(tail)
+                if connected is not None or pos == 0:
+                    return bool(connected)
     except OSError:
         return False
-    start = 0 if tail.startswith(BRIDGE_RECORD) else -1
-    found = tail.rfind(b"\n" + BRIDGE_RECORD)
-    if found >= 0:
-        start = found + 1
-    if start < 0:
-        return False
-    line = tail[start:].split(b"\n", 1)[0]
-    try:
-        return bool(json.loads(line).get("bridgeSessionId"))
-    except ValueError:
-        return False
+    return False
+
+
+def last_bridge_state(tail):
+    """bridgeSessionId truthiness of the last parseable bridge record; None if none."""
+    needle = b"\n" + BRIDGE_RECORD
+    found = tail.rfind(needle)
+    while found >= 0:
+        line = tail[found + 1:].split(b"\n", 1)[0]
+        try:
+            return bool(json.loads(line).get("bridgeSessionId"))
+        except ValueError:
+            # A record still being appended: fall back to the one before it.
+            found = tail.rfind(needle, 0, found)
+    return None
 
 
 def remote_section(transcript_path):
