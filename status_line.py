@@ -2,8 +2,10 @@
 """
 Claude Code Status Line
 
-Layout:  Model ver | repo @ branch | 312k/1M | cache 91% 52m | 5h 42% · 7d 71%
+Layout:  RC | Model ver | repo @ branch | 312k/1M | cache 91% 52m | 5h 42% · 7d 71%
 
+  - RC  (cyan, only while the session is connected to Remote Control; read from
+    the transcript's tail, since the JSON has no field for it)
   - Model name + version  (accent-colored by model family)
   - Active repo @ git branch  (green=clean, red=dirty/uncommitted edits)
   - Context tokens / window size, colored by absolute tokens, not percentage:
@@ -46,6 +48,7 @@ GREEN = "\033[38;2;34;197;94m"    # Clean branch
 RED = "\033[38;2;239;68;68m"      # Dirty branch / critical context
 YELLOW = "\033[33m"               # Elevated context
 ORANGE = "\033[38;5;208m"         # Near-limit context
+CYAN = "\033[38;2;34;211;238m"    # Remote Control badge
 
 # Model accent colors, matched by substring of the model name.
 MODEL_COLORS = {
@@ -65,6 +68,14 @@ LIMIT_WARN = 50       # yellow
 LIMIT_HIGH = 75       # orange
 LIMIT_CRITICAL = 90   # red
 LIMIT_WINDOWS = (("five_hour", "5h"), ("seven_day", "7d"))
+
+# Remote Control detection: how much of the transcript's end to scan for the
+# record (the small window first, then the full tail). Between turns it sits
+# within ~16 KB of the end; mid-turn, large tool output can push it back
+# further, so the badge may drop out until the turn ends.
+REMOTE_SCAN_BYTES = 65_536
+REMOTE_TAIL_BYTES = 1_048_576
+BRIDGE_RECORD = b'{"type":"bridge-session"'
 
 
 # =============================================================================
@@ -179,6 +190,55 @@ def cache_section(prompt_cache):
     return paint(f"cache cold{cost}", RED)
 
 
+def remote_connected(transcript_path):
+    """True when the last `bridge-session` record in the transcript's tail has an ID.
+
+    The JSON has no Remote Control field, but a connected session's transcript
+    re-appends `{"type":"bridge-session",...}` with its other metadata, so it sits
+    near the end of the file; disconnecting writes one with an empty
+    `bridgeSessionId`. Only lines that start with it count: the same text quoted
+    in a tool result is JSON-escaped and never starts a line.
+    """
+    if not transcript_path:
+        return False
+    try:
+        with open(transcript_path, "rb") as f:
+            size = f.seek(0, os.SEEK_END)
+            # Scan a small window first (the record is usually within ~16 KB of
+            # the end), widening to REMOTE_TAIL_BYTES only when it isn't there.
+            for window in (REMOTE_SCAN_BYTES, REMOTE_TAIL_BYTES):
+                # One byte before the window, so a record starting right at its
+                # edge still follows a newline; a cut-off partial line never does.
+                pos = max(0, size - window - 1)
+                f.seek(pos)
+                tail = (b"\n" if pos == 0 else b"") + f.read()
+                connected = last_bridge_state(tail)
+                if connected is not None or pos == 0:
+                    return bool(connected)
+    except OSError:
+        return False
+    return False
+
+
+def last_bridge_state(tail):
+    """bridgeSessionId truthiness of the last parseable bridge record; None if none."""
+    needle = b"\n" + BRIDGE_RECORD
+    found = tail.rfind(needle)
+    while found >= 0:
+        line = tail[found + 1:].split(b"\n", 1)[0]
+        try:
+            return bool(json.loads(line).get("bridgeSessionId"))
+        except ValueError:
+            # A record still being appended: fall back to the one before it.
+            found = tail.rfind(needle, 0, found)
+    return None
+
+
+def remote_section(transcript_path):
+    """'RC' while the session is connected to Remote Control; hidden otherwise."""
+    return paint("RC", CYAN) if remote_connected(transcript_path) else None
+
+
 def limits_section(rate_limits):
     """'5h 42% · 7d 71%' — plan usage limits; each window hidden when absent."""
     if not isinstance(rate_limits, dict):
@@ -216,6 +276,7 @@ def main():
     workspace = data.get("workspace") or {}
 
     sections = [
+        remote_section(data.get("transcript_path")),
         model_section(data.get("model", {})),
         repo_branch_section(workspace, cwd),
         context_section(data.get("context_window") or {}),
