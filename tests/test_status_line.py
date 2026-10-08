@@ -1,10 +1,11 @@
-"""Sample-JSON tests for the rate-limit segment of status_line.py."""
+"""Sample-JSON tests for the segments of status_line.py."""
 
 import json
 import os
 import re
 import subprocess
 import sys
+import tempfile
 import unittest
 
 SCRIPT = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "status_line.py")
@@ -79,6 +80,53 @@ class ContextTest(unittest.TestCase):
 
     def test_hidden_when_absent(self):
         self.assertIsNone(sl.context_section({}))
+
+
+BRIDGE_LINE = '{"type":"bridge-session","sessionId":"s","bridgeSessionId":"cse_1","lastSequenceNum":1}\n'
+DISCONNECT_LINE = '{"type":"bridge-session","sessionId":"s","bridgeSessionId":"","lastSequenceNum":0}\n'
+OTHER_LINE ='{"type":"assistant","message":{"content":"hi"}}\n'
+
+
+class RemoteTest(unittest.TestCase):
+    def transcript(self, text):
+        fd, path = tempfile.mkstemp(suffix=".jsonl")
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
+            f.write(text)
+        self.addCleanup(os.remove, path)
+        return path
+
+    def test_badge_when_bridge_record_in_tail(self):
+        path = self.transcript(OTHER_LINE + BRIDGE_LINE + OTHER_LINE)
+        self.assertEqual(ANSI.sub("", sl.remote_section(path)), "RC")
+
+    def test_bridge_record_on_first_line(self):
+        self.assertTrue(sl.remote_connected(self.transcript(BRIDGE_LINE)))
+
+    def test_hidden_without_bridge_record(self):
+        self.assertIsNone(sl.remote_section(self.transcript(OTHER_LINE * 3)))
+
+    def test_hidden_after_disconnect(self):
+        path = self.transcript(BRIDGE_LINE + OTHER_LINE + DISCONNECT_LINE + OTHER_LINE)
+        self.assertFalse(sl.remote_connected(path))
+
+    def test_reconnect_after_disconnect(self):
+        self.assertTrue(sl.remote_connected(self.transcript(DISCONNECT_LINE + OTHER_LINE + BRIDGE_LINE)))
+
+    def test_ignores_escaped_mention_in_tool_output(self):
+        quoted = json.dumps({"type": "user", "content": BRIDGE_LINE}) + "\n"
+        self.assertFalse(sl.remote_connected(self.transcript(quoted)))
+
+    def test_ignores_record_outside_tail(self):
+        path = self.transcript(BRIDGE_LINE + "x" * sl.REMOTE_TAIL_BYTES + "\n")
+        self.assertFalse(sl.remote_connected(path))
+
+    def test_missing_or_absent_path(self):
+        self.assertFalse(sl.remote_connected(None))
+        self.assertFalse(sl.remote_connected(os.path.join(tempfile.gettempdir(), "no-such-transcript.jsonl")))
+
+    def test_full_line_puts_badge_first(self):
+        out = ANSI.sub("", render(dict(BASE, transcript_path=self.transcript(BRIDGE_LINE))))
+        self.assertTrue(out.startswith("RC | Opus 5.5"), out)
 
 
 if __name__ == "__main__":
