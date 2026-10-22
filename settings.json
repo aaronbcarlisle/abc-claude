@@ -19,7 +19,17 @@
     "anthropic-skills:morning": "off",
     "anthropic-skills:import-memory": "off",
     "anthropic-skills:docs": "off",
-    "anthropic-skills:pdf": "off"
+    "anthropic-skills:pdf": "off",
+    "anthropic-skills:google-workspace": "off",
+    "anthropic-skills:built-in-browser": "off",
+    "anthropic-skills:computer-use": "off",
+    "anthropic-skills:deep-research": "off",
+    "chrome-devtools-mcp:a11y-debugging": "off",
+    "chrome-devtools-mcp:chrome-devtools-cli": "off",
+    "chrome-devtools-mcp:cookie-debugging": "off",
+    "chrome-devtools-mcp:debug-optimize-lcp": "off",
+    "chrome-devtools-mcp:memory-leak-debugging": "off",
+    "superpowers:diagnosing-superpowers": "off"
   },
   "hooks": {
     "SessionStart": [
